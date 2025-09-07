@@ -155,17 +155,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &outputs_data,
         &output_attrs,
         0.25,
-        1.0,
+        0.45,
         letterbox_info, // <-- 新增参数
     );
 
     // --- 10. 打印结果 ---
+    println!("--- 检测结果 ({} 个) ---", detections.len());
+    // 提前加载标签用于打印
+    let labels_for_print = drawing::load_labels(labels_path)?;
     for det in &detections {
+        let label = labels_for_print
+            .get(det.class_id as usize)
+            .map_or("unknown", |s| s.as_str());
         println!(
-            "类别: {}, 置信度: {:.2}, 框: {:?}",
-            det.class_id, det.confidence, det.bbox
+            "类别: {} ({}), 置信度: {:.4}, 框: {:?}", // 打印类别名和更精确的置信度
+            det.class_id, label, det.confidence, det.bbox
         );
     }
+    println!("--------------------------");
 
     // --- 11. 加载标签并绘制结果 ---
     println!("正在加载标签文件: {:?}", labels_path);

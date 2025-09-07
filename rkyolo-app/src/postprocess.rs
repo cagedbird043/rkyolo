@@ -169,36 +169,31 @@ pub fn post_process_i8(
         all_detections.extend(branch_detections);
     }
 
-    // --- 按类别进行非极大值抑制 (NMS) ---
-    let mut final_detections = Vec::new();
-    let mut detections_by_class: HashMap<i32, Vec<Detection>> = HashMap::new();
+    // --- 【NMS 逻辑重构】 ---
+    // 1. 按置信度对所有候选框进行一次全局降序排序
+    all_detections.sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
-    // 1. 按 class_id 分组
-    for det in all_detections {
-        detections_by_class
-            .entry(det.class_id)
-            .or_default()
-            .push(det);
+    let mut nms_detections = Vec::new();
+    while !all_detections.is_empty() {
+        // 2. 取出当前置信度最高的框
+        let best_det = all_detections.remove(0);
+        nms_detections.push(best_det.clone());
+
+        // 3. 过滤掉与 best_det 重叠度高且类别相同的框
+        all_detections.retain(|det| {
+            // 只有当类别相同时，才计算IoU进行抑制
+            if det.class_id == best_det.class_id {
+                calculate_iou(&best_det.bbox, &det.bbox) < nms_threshold
+            } else {
+                true // 不同类别，不抑制
+            }
+        });
     }
 
-    // 2. 对每个类别独立进行 NMS
-    for (_class_id, mut detections) in detections_by_class {
-        // 按置信度降序排序
-        detections.sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-
-        let mut nms_detections = Vec::new();
-        while !detections.is_empty() {
-            let best_det = detections.remove(0);
-            nms_detections.push(best_det.clone());
-
-            detections.retain(|det| calculate_iou(&best_det.bbox, &det.bbox) < nms_threshold);
-        }
-        final_detections.extend(nms_detections);
-    }
-
-    // --- 【关键修正】对最终结果进行坐标变换 ---
-    let mut corrected_detections = Vec::with_capacity(final_detections.len());
-    for det in final_detections {
+    // --- 对经过NMS的结果进行坐标变换 ---
+    let mut corrected_detections = Vec::with_capacity(nms_detections.len());
+    for det in nms_detections {
+        // 注意：这里我们遍历的是 nms_detections
         let bbox = det.bbox;
 
         // 应用Letterbox的逆运算
@@ -214,7 +209,7 @@ pub fn post_process_i8(
                 x2: corrected_x2,
                 y2: corrected_y2,
             },
-            ..det // Rust 的 struct update 语法，复用其他字段
+            ..det
         });
     }
 
