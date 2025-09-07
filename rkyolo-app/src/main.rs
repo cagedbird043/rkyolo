@@ -42,6 +42,10 @@ struct Args {
     lang: Lang,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     disable_zero_copy: bool,
+    #[arg(long)]
+    output_video: Option<String>,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    headless: bool,
 }
 
 /// 【全新】处理视频源的主循环
@@ -65,11 +69,28 @@ fn process_video_source(
         return Err(format!("Failed to open video source: {}", source).into());
     }
 
-    let window = "RKYOLO Live";
-    highgui::named_window(window, highgui::WINDOW_AUTOSIZE)?;
+    let window_name = "RKYOLO Live";
+    if !args.headless {
+        highgui::named_window(window_name, highgui::WINDOW_AUTOSIZE)?;
+    }
 
     let mut frame = Mat::default();
     let mut rgb_frame = Mat::default();
+
+    // 【新增】根据命令行参数，有条件地初始化 VideoWriter
+    let mut writer = match &args.output_video {
+        Some(path) => {
+            let fourcc = videoio::VideoWriter::fourcc('H', '2', '6', '4')?;
+            let fps = cap.get(videoio::CAP_PROP_FPS)?;
+            let size = core::Size::new(
+                cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as i32,
+                cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as i32,
+            );
+            info!("Recording output to '{}' at {} FPS", path, fps);
+            Some(videoio::VideoWriter::new(path, fourcc, fps, size, true)?)
+        }
+        None => None,
+    };
 
     loop {
         cap.read(&mut frame)?;
@@ -189,12 +210,20 @@ fn process_video_source(
             )?;
         }
 
-        // 5. 显示图像并处理键盘事件
-        highgui::imshow(window, &frame)?;
-        let key = highgui::wait_key(1)?;
-        if key == 'q' as i32 || key == 27 {
-            // 'q' or ESC key
-            break;
+        // 【新增】如果 writer 存在，则将当前帧写入视频文件
+        if let Some(writer) = &mut writer {
+            writer.write(&frame)?;
+        }
+
+        // 【修改】根据 --headless 参数，有条件地显示图像并处理键盘事件
+        if !args.headless {
+            highgui::imshow(window_name, &frame)?;
+            let key = highgui::wait_key(1)?;
+            if key == 'q' as i32 || key == 27 {
+                // 'q' or ESC key
+                info!("User pressed 'q' or ESC. Exiting video stream.");
+                break;
+            }
         }
     }
 
