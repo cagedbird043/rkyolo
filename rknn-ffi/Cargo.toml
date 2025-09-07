@@ -1,0 +1,11 @@
+[package]
+name = "rknn-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 目前我们的 FFI crate 自身不依赖任何运行时库，
+# 它的作用是纯粹地暴露 C API 的函数签名和数据结构。
+
+[build-dependencies]
+bindgen = "0.69.4"
