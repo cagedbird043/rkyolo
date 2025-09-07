@@ -155,7 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &outputs_data,
         &output_attrs,
         0.25,
-        0.45,
+        1.0,
         letterbox_info, // <-- 新增参数
     );
 

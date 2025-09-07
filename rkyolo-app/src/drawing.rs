@@ -20,26 +20,39 @@ pub fn load_labels(path: &Path) -> std::io::Result<Vec<String>> {
 pub fn draw_results(image: &mut RgbImage, detections: &[Detection], labels: &[String]) {
     let font_data: &[u8] = include_bytes!("../../NotoSans-Regular.ttf");
     let font = FontRef::try_from_slice(font_data).unwrap();
-
     let font_size = PxScale::from(20.0);
     let color_blue = Rgb([0, 0, 255u8]);
     let color_red = Rgb([255, 0, 0u8]);
 
+    let stroke_width = 3; // 我们可以从这里调整线宽
+
     for det in detections {
         let bbox = &det.bbox;
 
-        // 确保边界框坐标有效
-        let x1 = bbox.x1.max(0.0) as i32;
-        let y1 = bbox.y1.max(0.0) as i32;
-        let x2 = bbox.x2.max(bbox.x1) as i32;
-        let y2 = bbox.y2.max(bbox.y1) as i32;
+        // 【修正1】确保坐标在图像边界内 (clamp)
+        let x1 = bbox.x1.clamp(0.0, image.width() as f32 - 1.0) as i32;
+        let y1 = bbox.y1.clamp(0.0, image.height() as f32 - 1.0) as i32;
+        let x2 = bbox.x2.clamp(0.0, image.width() as f32 - 1.0) as i32;
+        let y2 = bbox.y2.clamp(0.0, image.height() as f32 - 1.0) as i32;
 
         let width = (x2 - x1) as u32;
         let height = (y2 - y1) as u32;
 
         if width > 0 && height > 0 {
             let rect = Rect::at(x1, y1).of_size(width, height);
-            draw_hollow_rect_mut(image, rect, color_blue);
+            // 【精准修正 2】: 循环绘制矩形以模拟加粗
+            for i in 0..stroke_width {
+                // 计算向外扩展1像素的矩形
+                // 注意：需要防止i32减法下溢
+                let x_offset = i as i32;
+                let y_offset = i as i32;
+                let w_offset = (i * 2) as u32;
+                let h_offset = (i * 2) as u32;
+
+                let stroked_rect = Rect::at(rect.left() - x_offset, rect.top() - y_offset)
+                    .of_size(rect.width() + w_offset, rect.height() + h_offset);
+                draw_hollow_rect_mut(image, stroked_rect, color_blue);
+            }
 
             let label = if (det.class_id as usize) < labels.len() {
                 &labels[det.class_id as usize]
