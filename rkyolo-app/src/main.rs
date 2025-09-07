@@ -30,43 +30,45 @@ impl fmt::Display for RknnError {
 impl Error for RknnError {}
 
 /// 使用 `image` crate 和 Letterboxing 技术预处理图像。
-fn preprocess_letterbox(
+fn preprocess_letterbox_quantize(
     image_path: &Path,
     target_width: u32,
     target_height: u32,
-) -> Result<(Vec<u8>, LetterboxInfo), image::ImageError> {
+    zp: i32,
+    scale: f32,
+) -> Result<(Vec<i8>, LetterboxInfo), image::ImageError> {
+    // 1. Letterbox 几何变换
     let img = image::open(image_path)?.to_rgb8();
     let (original_w, original_h) = img.dimensions();
-
-    // 1. 计算缩放比例
-    let scale_w = target_width as f32 / original_w as f32;
-    let scale_h = target_height as f32 / original_h as f32;
-    let scale = scale_w.min(scale_h);
-
-    // 2. 计算缩放后尺寸
-    let new_w = (original_w as f32 * scale) as u32;
-    let new_h = (original_h as f32 * scale) as u32;
-
-    // 缩放图像
-    let resized_img = imageops::resize(&img, new_w, new_h, imageops::FilterType::Lanczos3);
-
-    // 3. 创建灰色画布
+    let scale_val =
+        (target_width as f32 / original_w as f32).min(target_height as f32 / original_h as f32);
+    let new_w = (original_w as f32 * scale_val) as u32;
+    let new_h = (original_h as f32 * scale_val) as u32;
+    let resized_img = imageops::resize(&img, new_w, new_h, imageops::FilterType::Triangle);
     let mut canvas = RgbImage::from_pixel(target_width, target_height, Rgb([114, 114, 114]));
-
-    // 4. 计算填充
     let pad_x = (target_width - new_w) / 2;
     let pad_y = (target_height - new_h) / 2;
-
-    // 5. 粘贴图像
     imageops::overlay(&mut canvas, &resized_img, pad_x.into(), pad_y.into());
-
-    // 6. 返回数据和信息
     let info = LetterboxInfo {
-        scale,
+        scale: scale_val,
         pad_x,
         pad_y,
     };
-    Ok((canvas.into_raw(), info))
+    let u8_data = canvas.into_raw();
+
+    // 2. 【关键】手动归一化并量化
+    let i8_data: Vec<i8> = u8_data
+        .into_iter()
+        .map(|val_u8| {
+            // 正确的公式: q = round( (f_val / scale) + zp )
+            // 其中 f_val 是归一化后的浮点值
+            let f_val = val_u8 as f32 / 255.0; // <--- 之前遗漏的归一化步骤！
+            let q_val = (f_val / scale + zp as f32).round() as i32;
+            q_val.clamp(i8::MIN as i32, i8::MAX as i32) as i8
+        })
+        .collect();
+
+    Ok((i8_data, info))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -90,33 +92,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("RKNN 上下文初始化成功!");
 
     // --- 4. 查询模型输入属性 ---
-    println!("正在查询模型输入属性...");
     let input_attrs = ctx.query_input_attrs().map_err(RknnError)?;
-    let input_attr = &input_attrs[0]; // 假设只有一个输入
-
-    // 从属性中获取模型期望的输入尺寸和格式
-    // 注意：dims 数组的布局依赖于模型的 format (NHWC vs NCHW)
-    let (model_height, model_width, model_channels) =
+    let input_attr = &input_attrs[0];
+    let input_zp = input_attr.zp;
+    let input_scale = input_attr.scale;
+    println!("模型输入量化参数: zp={}, scale={}", input_zp, input_scale);
+    let (model_height, model_width, _) =
         if input_attr.fmt == rknn_ffi::raw::_rknn_tensor_format_RKNN_TENSOR_NHWC {
             (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3])
         } else {
-            // NCHW
             (input_attr.dims[2], input_attr.dims[3], input_attr.dims[1])
         };
-    println!(
-        "模型输入尺寸: {}x{}x{}",
-        model_width, model_height, model_channels
-    );
 
-    // --- 5. 预处理输入图片 ---
-    println!("正在预处理图片: {:?}", image_path);
-    // 调用新的 letterbox 函数
-    let (image_data, letterbox_info) = preprocess_letterbox(image_path, model_width, model_height)?;
+    // --- 5. 预处理输入图片并手动量化 ---
+    println!("正在预处理图片并执行手动量化...");
+    let (image_data_i8, letterbox_info) = preprocess_letterbox_quantize(
+        image_path,
+        model_width,
+        model_height,
+        input_zp,
+        input_scale,
+    )?;
 
     // --- 6. 设置输入并执行推理 ---
-    println!("正在设置输入数据并执行推理...");
-    ctx.set_input(0, input_attr.type_, input_attr.fmt, &image_data)
-        .map_err(RknnError)?;
+    println!("正在设置INT8输入数据并执行推理...");
+    // 将 Vec<i8> 的数据安全地转换为 &[u8] 以传递给 FFI
+    let image_data_u8: &[u8] = unsafe {
+        std::slice::from_raw_parts(image_data_i8.as_ptr() as *const u8, image_data_i8.len())
+    };
+    // 将输入类型明确设置为 INT8
+    ctx.set_input(
+        0,
+        rknn_ffi::raw::_rknn_tensor_type_RKNN_TENSOR_INT8,
+        input_attr.fmt,
+        image_data_u8,
+    )
+    .map_err(RknnError)?;
     ctx.run().map_err(RknnError)?;
     println!("推理完成!");
 

@@ -2,3 +2,5 @@
 bus.jpg
 yolo11.rknn
 *.jpg
+*.py
+test/
