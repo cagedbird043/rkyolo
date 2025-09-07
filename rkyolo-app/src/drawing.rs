@@ -18,7 +18,7 @@ pub fn load_labels(path: &Path) -> std::io::Result<Vec<String>> {
 
 /// 在图像上绘制检测结果。
 pub fn draw_results(image: &mut RgbImage, detections: &[Detection], labels: &[String]) {
-    let font_data: &[u8] = include_bytes!("../../NotoSans-Regular.ttf");
+    let font_data: &[u8] = include_bytes!("../../assets/NotoSans-Regular.ttf");
     let font = FontRef::try_from_slice(font_data).unwrap();
     let font_size = PxScale::from(20.0);
     let color_blue = Rgb([0, 0, 255u8]);

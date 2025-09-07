@@ -13,15 +13,15 @@ mod postprocess;
 #[command(version, about, long_about = None)]
 struct Args {
     /// .rknn 模型文件的路径
-    #[arg(short, long, default_value = "yolo11.rknn")]
+    #[arg(short, long, default_value = "assets/yolo11.rknn")]
     model: String,
 
     /// 要进行检测的输入图片路径
-    #[arg(short, long, default_value = "bus.jpg")]
+    #[arg(short, long, default_value = "assets/bus.jpg")]
     image: String,
 
     /// 包含类别名称的标签文件路径
-    #[arg(short, long, default_value = "coco_labels.txt")]
+    #[arg(short, long, default_value = "assets/coco_labels.txt")]
     labels: String,
 
     /// 输出结果图片的保存路径
@@ -105,9 +105,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 解析命令行参数
     let args = Args::parse();
     println!("配置参数: {:?}", args);
-
-    println!("RKNN YOLO Rust Demo - 启动");
-
     // --- 2. 使用解析出的路径 ---
     let model_path = Path::new(&args.model);
     let image_path = Path::new(&args.image);
@@ -231,7 +228,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("正在保存结果图片到: {:?}", output_path);
     original_image.save(output_path)?;
     println!("结果已保存！");
-
-    println!("Demo 运行结束。");
     Ok(())
 }
