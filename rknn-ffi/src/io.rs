@@ -1,3 +1,5 @@
+use crate::debug;
+
 use crate::raw;
 use std::ops::Deref;
 /// 一个安全封装，用于管理由 `rknn_outputs_get` 分配的输出张量。
@@ -80,7 +82,7 @@ impl Deref for RknnOutputs {
 
 impl Drop for RknnOutputs {
     fn drop(&mut self) {
-        println!("Dropping RknnOutputs and calling rknn_outputs_release...");
+        debug!("Dropping RknnOutputs and calling rknn_outputs_release...");
         unsafe {
             raw::rknn_outputs_release(
                 self.ctx,

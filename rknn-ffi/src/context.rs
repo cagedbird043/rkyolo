@@ -1,3 +1,4 @@
+use crate::debug;
 use crate::io::RknnOutputs;
 use crate::raw;
 
@@ -319,7 +320,7 @@ impl RknnContext {
             Err(ret)
         }
     }
-    
+
     /// 通用的张量属性查询方法（私有）。
     ///
     /// # Arguments
@@ -376,7 +377,7 @@ impl Drop for RknnContext {
         // 在这里调用底层的 C API 来销毁 RKNN 上下文
         // 这是一个 FFI 调用，因此必须在 unsafe 块中进行
         // 打印调试信息来确认 drop 确实被调用了
-        println!("Dropping RknnContext and calling rknn_destroy...");
+        debug!("Dropping RknnContext and calling rknn_destroy...");
         unsafe {
             raw::rknn_destroy(self.ctx);
         }

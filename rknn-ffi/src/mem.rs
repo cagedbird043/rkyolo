@@ -1,4 +1,4 @@
-use crate::raw;
+use crate::{debug, raw};
 
 /// 一个安全的 Rust 封装，用于表示一个由 RKNN 管理的 DMA 内存缓冲区。
 ///
@@ -31,7 +31,7 @@ impl RknnTensorMem {
 
 impl Drop for RknnTensorMem {
     fn drop(&mut self) {
-        println!("Dropping RknnTensorMem and calling rknn_destroy_mem...");
+        debug!("Dropping RknnTensorMem and calling rknn_destroy_mem...");
         unsafe {
             raw::rknn_destroy_mem(self.ctx, self.mem);
         }

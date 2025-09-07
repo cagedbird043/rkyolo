@@ -5,13 +5,14 @@
 
 **RKYOLO** is a modern, robust, and high-performance AI application foundation built from the ground up in Rust. It leverages Rockchip's NPU for hardware-accelerated inference of YOLO models, providing a superior alternative to the often brittle and hardcoded official C++ examples.
 
-This project was born out of the need for a production-ready framework that offers Rust's memory safety guarantees, a modern build system with Cargo, and a flexible, model-agnostic architecture that achieves near-hardware-limit performance.
+This project was born out of the need for a production-ready framework that offers Rust's memory safety guarantees, a modern build system with Cargo, and a flexible, model-agnostic architecture that achieves near-hardware-limit performance for **real-time video processing**.
 
 ## 🌟 Core Features
 
 - **Memory Safe**: Built with Rust to eliminate entire classes of bugs like segmentation faults and memory leaks at compile time, guaranteed by the compiler.
-- **Blazing Fast Zero-Copy Performance**: Implements a zero-copy data path by default, writing pre-processed data directly into DMA buffers to minimize CPU overhead and I/O latency. Achieves significant speedups over standard memory-copy methods.
-- **Intelligent Fallback**: Automatically and gracefully falls back to a standard memory-copy mode if zero-copy initialization fails, ensuring maximum performance where possible without sacrificing robustness.
+- **Blazing Fast Zero-Copy Performance**: Implements a zero-copy data path by default, writing pre-processed data directly into DMA buffers to minimize CPU overhead and I/O latency.
+- **🎥 Real-time Video & Camera Support**: Process live video feeds from V4L2 devices (e.g., `/dev/video0`) or video files with high framerates, displaying results in a live window.
+- **Intelligent Fallback**: Automatically and gracefully falls back to a standard memory-copy mode if zero-copy initialization fails, ensuring maximum performance without sacrificing robustness.
 - **Model Agnostic & Adaptive**: Dynamically adapts to different YOLO model architectures (e.g., varying number of outputs, different class counts) without requiring any code changes. It just works.
 - **Professional Logging**: Features a multi-level (`-v`, `-vv`) and multi-lingual (`--lang en/zh`) logging system for clear, informative feedback and easy debugging.
 - **Clean, Modular Architecture**: Organized as a Cargo Workspace with a clear separation between the low-level, modular FFI layer (`rknn-ffi`), the core logic (`rkyolo-core`), and the application itself (`rkyolo-app`).
@@ -21,8 +22,9 @@ This project was born out of the need for a production-ready framework that offe
 ### Prerequisites
 
 - A Rockchip development board (e.g., RK3588) with the official SDK and RKNN runtime (`librknnrt.so`) correctly installed.
-- Rust toolchain installed on the device. You can install it via [rustup](https://rustup.rs/).
-- A C toolchain (`gcc`) for compiling dependencies.
+- Rust toolchain installed on the device via [rustup](https://rustup.rs/).
+- A C toolchain (`gcc`).
+- **OpenCV development libraries** (e.g., `sudo apt install libopencv-dev`).
 - A YOLO model converted to the `.rknn` format.
 
 ### Building the Project
@@ -35,58 +37,66 @@ This project was born out of the need for a production-ready framework that offe
     ```
 
 2.  **Build the application in release mode for maximum performance:**
+    _Note: The first build may take a significant amount of time due to the `opencv` crate._
+
     ```bash
     cargo build --release
     ```
+
     The final executable will be located at `target/release/rkyolo-app`.
 
-## 💻 Usage
+## 💻 Usage Examples
 
-The application is controlled via a powerful and user-friendly command-line interface.
+The application is controlled via a universal `--source` (or `-s`) argument.
 
-### Basic Inference
+### 1. Real-time Camera Inference (Flagship Feature)
 
-Run inference on a single image. The application will automatically attempt to use the high-performance zero-copy mode.
+This command opens the default camera (`/dev/video0`), performs real-time inference on each frame using the custom tassel model, and displays the results. Press 'q' or ESC in the window to quit.
 
 ```bash
 ./target/release/rkyolo-app \
-    --model /path/to/your/model.rknn \
-    --input /path/to/your/image.jpg \
-    --labels /path/to/labels.txt \
-    --output result.jpg
+    -m ./MTDC-UAV.rknn \
+    -s /dev/video0 \
+    -l ./tassel_labels.txt \
+    --conf-thresh 0.45 \
+    --iou-thresh 0.50 \
+    --lang zh
 ```
 
-### Advanced Usage Examples
+### 2. Video File Inference
 
-**1. Increase Log Verbosity and Switch to Chinese:**
-Use the `-v` flag for INFO-level, `-vv` for DEBUG-level logs.
+Process a pre-recorded video file and display the results in real-time.
 
 ```bash
 ./target/release/rkyolo-app \
-    -m model.rknn -i image.jpg -l labels.txt -o out.jpg \
-    -v --lang zh
+    -m model.rknn \
+    -s my_video.mp4 \
+    -l labels.txt
 ```
 
-**2. Disable Zero-Copy for Debugging or Compatibility:**
-Force the application to use the standard (safer but slower) memory-copy mode.
+### 3. Single Image Inference
+
+Run inference on a single image and save the output.
 
 ```bash
 ./target/release/rkyolo-app \
-    -m model.rknn -i image.jpg -l labels.txt -o out.jpg \
-    --disable-zero-copy
+    -m model.rknn \
+    -s image.jpg \
+    -l labels.txt \
+    -o result.jpg
 ```
 
-**3. Running on the Corn Tassel Model:**
-A real-world example demonstrating the model-agnostic capabilities of RKYOLO.
+### 4. Advanced Control (Logging & Performance)
+
+Force the use of standard memory-copy mode and enable verbose debug logs.
 
 ```bash
 ./target/release/rkyolo-app \
-    --model ./MTDC-UAV.rknn \
-    --image ./corn_field.jpg \
-    --labels ./tassel_labels.txt \
-    --output ./tassel_result.jpg \
-    --conf-thresh 0.26 \
-    --iou-thresh 0.57
+    -s /dev/video0 \
+    -m model.rknn \
+    -l labels.txt \
+    --disable-zero-copy \
+    -vv
 ```
 
 ### All Options

@@ -1,10 +1,11 @@
 use clap::Parser;
 use log::{debug, error, info, warn};
+use opencv::{core, highgui, imgproc, prelude::*, videoio};
 use rkyolo_core::rknn_ffi::raw::rknn_tensor_attr;
 use rkyolo_core::{
     Detection, Lang, RknnContext, RknnError, draw_results, get_type_string, image, load_labels,
-    post_process_i8, preprocess_letterbox_quantize, preprocess_letterbox_quantize_zero_copy,
-    rknn_ffi,
+    post_process_i8, preprocess_letterbox_quantize_from_buffer,
+    preprocess_letterbox_quantize_zero_copy_from_buffer, rknn_ffi, rknn_ffi::RknnTensorMem,
 };
 use std::collections::HashMap;
 use std::error::Error;
@@ -13,57 +14,410 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 enum ExecutionMode {
-    /// 零拷贝模式。
-    /// 它需要拥有为输入分配的 DMA 内存 (`input_mem`)，
-    /// 以及描述该内存布局的硬件原生属性 (`input_attr`)，特别是 w_stride。
     ZeroCopy {
-        input_mem: rknn_ffi::RknnTensorMem,
+        input_mem: RknnTensorMem,
         input_attr: rknn_ffi::raw::rknn_tensor_attr,
     },
-    /// 标准拷贝模式。
-    /// 这种模式是无状态的，每次推理前都会通过 `rknn_inputs_set` 传递数据。
     Standard,
 }
 
-/// 一个使用 Rust 和 Rockchip NPU 进行 YOLO 模型推理的应用
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// .rknn 模型文件的路径
     #[arg(short, long, default_value = "assets/yolo11.rknn")]
     model: String,
-
-    /// 要进行检测的输入图片路径，也可以是一个包含图片的目录
     #[arg(short, long, default_value = "assets/bus.jpg")]
-    input: String,
-
-    /// 包含类别名称的标签文件路径
+    source: String,
     #[arg(short, long, default_value = "assets/coco_labels.txt")]
     labels: String,
-
-    /// 输出结果图片的保存路径，如果输入是文件，则为输出文件名；如果输入是目录，则为输出目录
     #[arg(short, long, default_value = "output.jpg")]
     output: String,
-
-    /// 置信度阈值
     #[arg(long, default_value_t = 0.25)]
     conf_thresh: f32,
-
-    /// NMS (非极大值抑制) 的 IoU 阈值
     #[arg(long, default_value_t = 0.45)]
     iou_thresh: f32,
-
-    /// 增加日志详细程度 (-v -> debug, -vv -> trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
-
-    /// 设置日志和输出信息的语言
     #[arg(long, value_enum, default_value_t = rkyolo_core::Lang::En)]
     lang: Lang,
-
-    /// 设置是否禁用零拷贝模式，强制使用标准拷贝模式
     #[arg(long, action = clap::ArgAction::SetTrue)]
     disable_zero_copy: bool,
+}
+
+/// 【全新】处理视频源的主循环
+fn process_video_source(
+    ctx: &mut RknnContext,
+    mode: &mut ExecutionMode,
+    source: &str,
+    labels: &[String],
+    args: &Args,
+) -> Result<(), Box<dyn Error>> {
+    let mut cap = if source.starts_with("/dev/video") {
+        let device_id: i32 = source.trim_start_matches("/dev/video").parse().unwrap_or(0);
+        info!("Opening camera device with ID: {}", device_id);
+        videoio::VideoCapture::new(device_id, videoio::CAP_ANY)?
+    } else {
+        info!("Opening video file: {}", source);
+        videoio::VideoCapture::from_file(source, videoio::CAP_ANY)?
+    };
+
+    if !cap.is_opened()? {
+        return Err(format!("Failed to open video source: {}", source).into());
+    }
+
+    let window = "RKYOLO Live";
+    highgui::named_window(window, highgui::WINDOW_AUTOSIZE)?;
+
+    let mut frame = Mat::default();
+    let mut rgb_frame = Mat::default();
+
+    loop {
+        cap.read(&mut frame)?;
+        if frame.empty() {
+            info!("Video stream ended.");
+            break;
+        }
+
+        // 1. 颜色空间转换 BGR -> RGB
+        imgproc::cvt_color(&frame, &mut rgb_frame, imgproc::COLOR_BGR2RGB, 0)?;
+        let frame_width = rgb_frame.cols() as u32;
+        let frame_height = rgb_frame.rows() as u32;
+        let frame_data = rgb_frame.data_bytes()?;
+
+        // 2. 预处理 + 推理 (根据模式选择不同路径)
+        let letterbox_info = match mode {
+            ExecutionMode::ZeroCopy {
+                input_mem,
+                input_attr,
+            } => {
+                let (model_h, model_w, _) =
+                    (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3]);
+                preprocess_letterbox_quantize_zero_copy_from_buffer(
+                    frame_width,
+                    frame_height,
+                    frame_data,
+                    model_w,
+                    model_h,
+                    input_attr.w_stride,
+                    input_attr.zp,
+                    input_attr.scale,
+                    input_mem.as_mut_slice(),
+                )?
+            }
+            ExecutionMode::Standard => {
+                let input_attrs = ctx.query_input_attrs().map_err(RknnError::from)?;
+                let input_attr = &input_attrs[0];
+                let (model_h, model_w, _) =
+                    (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3]);
+
+                let (image_data_i8, info) = preprocess_letterbox_quantize_from_buffer(
+                    frame_width,
+                    frame_height,
+                    frame_data,
+                    model_w,
+                    model_h,
+                    input_attr.zp,
+                    input_attr.scale,
+                )?;
+                let image_data_u8: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        image_data_i8.as_ptr() as *const u8,
+                        image_data_i8.len(),
+                    )
+                };
+                ctx.set_input(
+                    0,
+                    rknn_ffi::raw::_rknn_tensor_type_RKNN_TENSOR_INT8,
+                    input_attr.fmt,
+                    image_data_u8,
+                )
+                .map_err(RknnError)?;
+                info
+            }
+        };
+
+        ctx.run().map_err(RknnError)?;
+
+        // 3. 获取输出并进行后处理
+        let outputs_obj = ctx.get_outputs().map_err(RknnError)?;
+        let output_attrs = ctx.query_output_attrs().map_err(RknnError)?;
+        let outputs_data: Vec<&[u8]> = outputs_obj
+            .iter()
+            .map(|o| unsafe { std::slice::from_raw_parts(o.buf as *const u8, o.size as usize) })
+            .collect();
+        let detections = post_process_i8(
+            &outputs_data,
+            &output_attrs,
+            args.conf_thresh,
+            args.iou_thresh,
+            letterbox_info,
+        );
+
+        // 4. 在原始帧 (BGR) 上绘制结果
+        for det in &detections {
+            let bbox = &det.bbox;
+            let rect = core::Rect::new(
+                bbox.x1 as i32,
+                bbox.y1 as i32,
+                (bbox.x2 - bbox.x1) as i32,
+                (bbox.y2 - bbox.y1) as i32,
+            );
+            imgproc::rectangle(
+                &mut frame,
+                rect,
+                core::Scalar::new(255.0, 0.0, 0.0, 0.0),
+                2,
+                imgproc::LINE_8,
+                0,
+            )?;
+
+            let label = labels
+                .get(det.class_id as usize)
+                .map_or("unknown", |s| s.as_str());
+            let text = format!("{} {:.2}", label, det.confidence);
+            let org = core::Point::new(rect.x, rect.y - 10);
+            imgproc::put_text(
+                &mut frame,
+                &text,
+                org,
+                imgproc::FONT_HERSHEY_SIMPLEX,
+                0.8,
+                core::Scalar::new(255.0, 0.0, 0.0, 0.0),
+                2,
+                imgproc::LINE_8,
+                false,
+            )?;
+        }
+
+        // 5. 显示图像并处理键盘事件
+        highgui::imshow(window, &frame)?;
+        let key = highgui::wait_key(1)?;
+        if key == 'q' as i32 || key == 27 {
+            // 'q' or ESC key
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+    env_logger::Builder::new()
+        .filter_level(match args.verbose {
+            0 => log::LevelFilter::Info,
+            1 => log::LevelFilter::Debug,
+            _ => log::LevelFilter::Trace,
+        })
+        .init();
+    debug!("Parsed arguments: {:?}", args);
+
+    let model_data = fs::read(&args.model)?;
+    let mut ctx = RknnContext::new(&model_data, 0, None).map_err(RknnError)?;
+    let labels = load_labels(Path::new(&args.labels))?;
+
+    let mut execution_mode = if args.disable_zero_copy {
+        info!("Zero-copy mode disabled by argument.");
+        ExecutionMode::Standard
+    } else {
+        try_setup_zero_copy(&mut ctx, &args.lang)?
+    };
+
+    info!("--- Model Initialized ---");
+    let input_attrs = ctx.query_input_attrs().map_err(RknnError::from)?;
+    let output_attrs = ctx.query_output_attrs().map_err(RknnError::from)?;
+    log_tensor_attrs(&input_attrs, "Input Tensors", "输入张量", &args.lang);
+    log_tensor_attrs(&output_attrs, "Output Tensors", "输出张量", &args.lang);
+    info!("-------------------------");
+
+    let source_path = Path::new(&args.source);
+    let source_str = args.source.as_str();
+
+    if source_str.starts_with("/dev/video")
+        || source_str.ends_with(".mp4")
+        || source_str.ends_with(".avi")
+        || source_str.ends_with(".mov")
+    {
+        // 视频处理分支
+        process_video_source(&mut ctx, &mut execution_mode, source_str, &labels, &args)?;
+    } else if source_path.is_file() {
+        // 单图片处理分支
+        info!("\nProcessing single image: {:?}", source_path);
+        process_single_image(&mut ctx, &mut execution_mode, source_path, &labels, &args)?;
+    } else if source_path.is_dir() {
+        // 目录处理分支
+        info!("\nProcessing all images in directory: {:?}", source_path);
+        for entry in WalkDir::new(source_path).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                if ["jpg", "jpeg", "png", "bmp"].contains(&ext.to_lowercase().as_str()) {
+                    info!("\n--- Processing image: {:?} ---", path);
+                    if let Err(e) =
+                        process_single_image(&mut ctx, &mut execution_mode, path, &labels, &args)
+                    {
+                        error!("Error processing file {:?}: {}", path, e);
+                    }
+                }
+            }
+        }
+    } else {
+        return Err(format!(
+            "Source not found or is not a valid file/directory/video device: {}",
+            args.source
+        )
+        .into());
+    }
+
+    info!("\nAll tasks completed.");
+    Ok(())
+}
+
+// 图片处理函数 (从文件)
+fn process_single_image(
+    ctx: &mut RknnContext,
+    mode: &mut ExecutionMode,
+    image_path: &Path,
+    labels: &[String],
+    args: &Args,
+) -> Result<(), Box<dyn Error>> {
+    let mut original_image = image::open(image_path)?.to_rgb8();
+    let letterbox_info = match mode {
+        ExecutionMode::ZeroCopy {
+            input_mem,
+            input_attr,
+        } => {
+            let (model_h, model_w, _) =
+                (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3]);
+            rkyolo_core::preprocess_letterbox_quantize_zero_copy(
+                image_path,
+                model_w,
+                model_h,
+                input_attr.w_stride,
+                input_attr.zp,
+                input_attr.scale,
+                input_mem.as_mut_slice(),
+            )
+            .map_err(|e| e.to_string())?
+        }
+        ExecutionMode::Standard => {
+            let input_attrs = ctx.query_input_attrs().map_err(RknnError::from)?;
+            let input_attr = &input_attrs[0];
+            let (model_h, model_w, _) =
+                (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3]);
+            let (image_data_i8, info) = rkyolo_core::preprocess_letterbox_quantize(
+                image_path,
+                model_w,
+                model_h,
+                input_attr.zp,
+                input_attr.scale,
+            )?;
+            let image_data_u8: &[u8] = unsafe {
+                std::slice::from_raw_parts(image_data_i8.as_ptr() as *const u8, image_data_i8.len())
+            };
+            ctx.set_input(
+                0,
+                rknn_ffi::raw::_rknn_tensor_type_RKNN_TENSOR_INT8,
+                input_attr.fmt,
+                image_data_u8,
+            )
+            .map_err(RknnError)?;
+            info
+        }
+    };
+
+    ctx.run().map_err(RknnError)?;
+    let outputs_obj = ctx.get_outputs().map_err(RknnError)?;
+    let output_attrs = ctx.query_output_attrs().map_err(RknnError)?;
+    let outputs_data: Vec<&[u8]> = outputs_obj
+        .iter()
+        .map(|o| unsafe { std::slice::from_raw_parts(o.buf as *const u8, o.size as usize) })
+        .collect();
+    let detections = post_process_i8(
+        &outputs_data,
+        &output_attrs,
+        args.conf_thresh,
+        args.iou_thresh,
+        letterbox_info,
+    );
+
+    log_detection_summary(&detections, labels, &args.lang);
+    draw_results(&mut original_image, &detections, labels);
+
+    let output_path = if Path::new(&args.output).is_dir() {
+        image_path.file_name().ok_or("Invalid image path")?.into()
+    } else {
+        PathBuf::from(&args.output)
+    };
+    info!("Saving result to: {:?}", output_path);
+    original_image.save(&output_path)?;
+    Ok(())
+}
+
+/// 尝试设置零拷贝执行模式。
+/// 如果成功，返回配置好的 ZeroCopy 模式。
+/// 如果失败，打印警告并返回 Standard 模式作为降级。
+fn try_setup_zero_copy(ctx: &mut RknnContext, lang: &Lang) -> Result<ExecutionMode, RknnError> {
+    // 1. 查询原生属性
+    let native_input_attrs = match ctx.query_native_input_attrs() {
+        Ok(attrs) => attrs,
+        Err(e) => {
+            match lang {
+                Lang::En => warn!(
+                    "Failed to query native input attributes (code: {}). Falling back to standard mode.",
+                    e
+                ),
+                Lang::Zh => warn!("查询原生输入属性失败 (错误码: {})。将降级到标准模式。", e),
+            }
+            return Ok(ExecutionMode::Standard);
+        }
+    };
+    // 我们只关心第一个输入
+    let input_attr = if let Some(attr) = native_input_attrs.get(0) {
+        attr.clone() // Clone attr so we can own it in ExecutionMode
+    } else {
+        match lang {
+            Lang::En => warn!("No native input attributes found. Falling back to standard mode."),
+            Lang::Zh => warn!("未找到原生输入属性。将降级到标准模式。"),
+        }
+        return Ok(ExecutionMode::Standard);
+    };
+
+    // 2. 创建 DMA 内存
+    let input_mem = match ctx.create_mem(input_attr.size_with_stride) {
+        Ok(mem) => mem,
+        Err(e) => {
+            match lang {
+                Lang::En => warn!(
+                    "Failed to create DMA memory (code: {}). Falling back to standard mode.",
+                    e
+                ),
+                Lang::Zh => warn!("创建 DMA 内存失败 (错误码: {})。将降级到标准模式。", e),
+            }
+            return Ok(ExecutionMode::Standard);
+        }
+    };
+
+    // 3. 绑定内存
+    if let Err(e) = ctx.set_io_mem(&input_mem, &input_attr) {
+        match lang {
+            Lang::En => warn!(
+                "Failed to set IO memory (code: {}). Falling back to standard mode.",
+                e
+            ),
+            Lang::Zh => warn!("设置 IO 内存失败 (错误码: {})。将降级到标准模式。", e),
+        }
+        return Ok(ExecutionMode::Standard);
+    }
+
+    // 如果所有步骤都成功
+    match lang {
+        Lang::En => info!("Successfully initialized Zero-Copy mode."),
+        Lang::Zh => info!("零拷贝模式初始化成功。"),
+    }
+    Ok(ExecutionMode::ZeroCopy {
+        input_mem,
+        input_attr,
+    })
 }
 
 /// 【新增】辅助函数：记录检测结果摘要
@@ -138,276 +492,4 @@ fn log_tensor_attrs(attrs: &[rknn_tensor_attr], name_en: &str, name_zh: &str, la
             attr.scale
         );
     }
-}
-
-/// 处理单张图片的完整流程
-fn process_single_image(
-    ctx: &mut RknnContext,
-    mode: &mut ExecutionMode, // <--- 新增参数
-    image_path: &Path,
-    labels: &[String],
-    args: &Args,
-) -> Result<(), Box<dyn Error>> {
-    let mut original_image = image::open(image_path)?.to_rgb8();
-
-    let letterbox_info = match mode {
-        ExecutionMode::ZeroCopy {
-            input_mem,
-            input_attr,
-        } => {
-            let (model_height, model_width, _) =
-                if input_attr.fmt == rknn_ffi::raw::_rknn_tensor_format_RKNN_TENSOR_NHWC {
-                    (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3])
-                } else {
-                    (input_attr.dims[2], input_attr.dims[3], input_attr.dims[1])
-                };
-
-            let buffer = input_mem.as_mut_slice();
-            let info = preprocess_letterbox_quantize_zero_copy(
-                image_path,
-                model_width,
-                model_height,
-                input_attr.w_stride,
-                input_attr.zp,
-                input_attr.scale,
-                buffer,
-            )?;
-            // 零拷贝模式下，不需要调用 ctx.set_input()
-            info
-        }
-        ExecutionMode::Standard => {
-            let input_attrs = ctx.query_input_attrs().map_err(RknnError::from)?;
-            let input_attr = &input_attrs[0];
-            let (model_height, model_width, _) =
-                if input_attr.fmt == rknn_ffi::raw::_rknn_tensor_format_RKNN_TENSOR_NHWC {
-                    (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3])
-                } else {
-                    (input_attr.dims[2], input_attr.dims[3], input_attr.dims[1])
-                };
-            let (image_data_i8, info) = preprocess_letterbox_quantize(
-                image_path,
-                model_width,
-                model_height,
-                input_attr.zp,
-                input_attr.scale,
-            )?;
-            let image_data_u8: &[u8] = unsafe {
-                std::slice::from_raw_parts(image_data_i8.as_ptr() as *const u8, image_data_i8.len())
-            };
-            ctx.set_input(
-                0,
-                rknn_ffi::raw::_rknn_tensor_type_RKNN_TENSOR_INT8,
-                input_attr.fmt,
-                image_data_u8,
-            )
-            .map_err(RknnError)?;
-            info
-        }
-    };
-    ctx.run().map_err(RknnError)?;
-
-    let outputs_obj = ctx.get_outputs().map_err(RknnError)?;
-    let output_attrs = ctx.query_output_attrs().map_err(RknnError)?;
-    let outputs_data: Vec<&[u8]> = outputs_obj
-        .all()
-        .iter()
-        .map(|o| unsafe { std::slice::from_raw_parts(o.buf as *const u8, o.size as usize) })
-        .collect();
-
-    let detections = post_process_i8(
-        &outputs_data,
-        &output_attrs,
-        args.conf_thresh,
-        args.iou_thresh,
-        letterbox_info,
-    );
-
-    // 【新增】调用辅助函数打印检测摘要
-    log_detection_summary(&detections, labels, &args.lang);
-
-    draw_results(&mut original_image, &detections, labels);
-
-    let output_path = if Path::new(&args.output).is_dir() {
-        let file_name = image_path.file_name().ok_or("Invalid image path")?;
-        PathBuf::from(&args.output).join(file_name)
-    } else {
-        PathBuf::from(&args.output)
-    };
-
-    match args.lang {
-        Lang::En => info!("Saving result to: {:?}", output_path),
-        Lang::Zh => info!("结果保存至: {:?}", output_path),
-    }
-    original_image.save(&output_path)?;
-
-    Ok(())
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
-    // 【修改】默认级别为 Info
-    let log_level = match args.verbose {
-        0 => log::LevelFilter::Info,
-        1 => log::LevelFilter::Debug,
-        _ => log::LevelFilter::Trace,
-    };
-    env_logger::Builder::new().filter_level(log_level).init();
-
-    debug!("Parsed command line arguments: {:?}", args);
-
-    let model_path = Path::new(&args.model);
-    let input_path = Path::new(&args.input);
-    let labels_path = Path::new(&args.labels);
-    let output_path = Path::new(&args.output);
-
-    let model_data = fs::read(model_path)?;
-    let mut ctx = RknnContext::new(&model_data, 0, None).map_err(RknnError)?;
-    let mut execution_mode = if args.disable_zero_copy {
-        match args.lang {
-            Lang::En => info!("Zero-copy mode is disabled by command line argument."),
-            Lang::Zh => info!("零拷贝模式已通过命令行参数禁用。"),
-        }
-        ExecutionMode::Standard
-    } else {
-        try_setup_zero_copy(&mut ctx, &args.lang)?
-    }; // let mut execution_mode = ExecutionMode::Standard;
-    let labels = load_labels(labels_path)?;
-
-    // 【新增】打印模型信息摘要
-    info!(
-        "{}",
-        match args.lang {
-            Lang::En => "--- Model Initialized ---",
-            Lang::Zh => "--- 模型初始化完成 ---",
-        }
-    );
-    let input_attrs = ctx.query_input_attrs().map_err(RknnError::from)?;
-    let output_attrs = ctx.query_output_attrs().map_err(RknnError::from)?;
-    log_tensor_attrs(&input_attrs, "Input Tensors", "输入张量", &args.lang);
-    log_tensor_attrs(&output_attrs, "Output Tensors", "输出张量", &args.lang);
-    info!("-------------------------");
-
-    if input_path.is_file() {
-        if output_path.is_dir() {
-            fs::create_dir_all(output_path)?;
-        }
-        match args.lang {
-            Lang::En => info!("\nProcessing single image: {:?}", input_path),
-            Lang::Zh => info!("\n处理单张图片: {:?}", input_path),
-        }
-        process_single_image(&mut ctx, &mut execution_mode, input_path, &labels, &args)?;
-    } else if input_path.is_dir() {
-        fs::create_dir_all(output_path)?;
-        match args.lang {
-            Lang::En => info!("\nProcessing all images in directory: {:?}", input_path),
-            Lang::Zh => info!("\n处理目录中的所有图片: {:?}", input_path),
-        }
-
-        for entry in WalkDir::new(input_path).into_iter().filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                match ext.to_lowercase().as_str() {
-                    "jpg" | "jpeg" | "png" | "bmp" => {
-                        match args.lang {
-                            Lang::En => info!("\n--- Processing image: {:?} ---", path),
-                            Lang::Zh => info!("\n--- 正在处理图片: {:?} ---", path),
-                        }
-                        if let Err(e) = process_single_image(
-                            &mut ctx,
-                            &mut execution_mode,
-                            path,
-                            &labels,
-                            &args,
-                        ) {
-                            match args.lang {
-                                Lang::En => error!("Error processing file {:?}: {}", path, e),
-                                Lang::Zh => error!("处理文件 {:?} 时发生错误: {}", path, e),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    } else {
-        let err_msg = format!(
-            "Input path not found or is not a file/directory: {}",
-            args.input
-        );
-        error!("{}", &err_msg);
-        return Err(err_msg.into());
-    }
-    match args.lang {
-        Lang::En => info!("\nAll tasks completed."),
-        Lang::Zh => info!("\n所有任务已完成。"),
-    }
-    Ok(())
-}
-
-/// 尝试设置零拷贝执行模式。
-/// 如果成功，返回配置好的 ZeroCopy 模式。
-/// 如果失败，打印警告并返回 Standard 模式作为降级。
-fn try_setup_zero_copy(ctx: &mut RknnContext, lang: &Lang) -> Result<ExecutionMode, RknnError> {
-    // 1. 查询原生属性
-    let native_input_attrs = match ctx.query_native_input_attrs() {
-        Ok(attrs) => attrs,
-        Err(e) => {
-            match lang {
-                Lang::En => warn!(
-                    "Failed to query native input attributes (code: {}). Falling back to standard mode.",
-                    e
-                ),
-                Lang::Zh => warn!("查询原生输入属性失败 (错误码: {})。将降级到标准模式。", e),
-            }
-            return Ok(ExecutionMode::Standard);
-        }
-    };
-    // 我们只关心第一个输入
-    let input_attr = if let Some(attr) = native_input_attrs.get(0) {
-        attr.clone() // Clone attr so we can own it in ExecutionMode
-    } else {
-        match lang {
-            Lang::En => warn!("No native input attributes found. Falling back to standard mode."),
-            Lang::Zh => warn!("未找到原生输入属性。将降级到标准模式。"),
-        }
-        return Ok(ExecutionMode::Standard);
-    };
-
-    // 2. 创建 DMA 内存
-    let input_mem = match ctx.create_mem(input_attr.size_with_stride) {
-        Ok(mem) => mem,
-        Err(e) => {
-            match lang {
-                Lang::En => warn!(
-                    "Failed to create DMA memory (code: {}). Falling back to standard mode.",
-                    e
-                ),
-                Lang::Zh => warn!("创建 DMA 内存失败 (错误码: {})。将降级到标准模式。", e),
-            }
-            return Ok(ExecutionMode::Standard);
-        }
-    };
-
-    // 3. 绑定内存
-    if let Err(e) = ctx.set_io_mem(&input_mem, &input_attr) {
-        match lang {
-            Lang::En => warn!(
-                "Failed to set IO memory (code: {}). Falling back to standard mode.",
-                e
-            ),
-            Lang::Zh => warn!("设置 IO 内存失败 (错误码: {})。将降级到标准模式。", e),
-        }
-        return Ok(ExecutionMode::Standard);
-    }
-
-    // 如果所有步骤都成功
-    match lang {
-        Lang::En => info!("Successfully initialized Zero-Copy mode."),
-        Lang::Zh => info!("零拷贝模式初始化成功。"),
-    }
-    Ok(ExecutionMode::ZeroCopy {
-        input_mem,
-        input_attr,
-    })
 }
