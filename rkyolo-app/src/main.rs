@@ -9,9 +9,10 @@ use rkyolo_core::{
 };
 use std::collections::HashMap;
 use std::error::Error;
-use std::fs;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+use std::time::Instant;
+use std::{env, fs};
+use walkdir::WalkDir; // 用于测量时间
 
 enum ExecutionMode {
     ZeroCopy {
@@ -77,10 +78,29 @@ fn process_video_source(
     let mut frame = Mat::default();
     let mut rgb_frame = Mat::default();
 
+    // 【新增】根据 --output-video 参数，有条件地设置 FFmpeg 硬件编码器环境变量
+    let _env_guard = if let Some(output_path) = &args.output_video {
+        if output_path.ends_with(".mp4") {
+            // 或者你可以根据其他条件来判断是否需要硬件编码
+            let encoder_options = format!("-codec:v h264_rkmpp"); // 显式指定硬件编码器
+            info!(
+                "Setting OPENCV_FFMPEG_WRITER_OPTIONS to: '{}'",
+                encoder_options
+            );
+            // env::set_var 会返回一个 Guard，当 Guard 离开作用域时环境变量会被还原
+            // 这确保了我们设置的环境变量只对 VideoWriter.new() 调用有效，不会污染全局环境
+            Some(unsafe { env::set_var("OPENCV_FFMPEG_WRITER_OPTIONS", encoder_options) })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // 【新增】根据命令行参数，有条件地初始化 VideoWriter
     let mut writer = match &args.output_video {
         Some(path) => {
-            let fourcc = videoio::VideoWriter::fourcc('H', '2', '6', '4')?;
+            let fourcc = videoio::VideoWriter::fourcc('a', 'v', 'c', '1')?; // 使用更通用的 H.264 FourCC tag
             let fps = cap.get(videoio::CAP_PROP_FPS)?;
             let size = core::Size::new(
                 cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as i32,
@@ -92,11 +112,27 @@ fn process_video_source(
         None => None,
     };
 
+    let mut last_fps_update_time = Instant::now();
+    let mut frame_count_since_last_update: u32 = 0;
+    let mut fps_display_text = String::from("FPS: N/A");
+
     loop {
         cap.read(&mut frame)?;
         if frame.empty() {
             info!("Video stream ended.");
             break;
+        }
+
+        // 【新增】FPS 计算逻辑
+        frame_count_since_last_update += 1;
+        let elapsed_time = last_fps_update_time.elapsed();
+
+        // 每秒钟更新一次 FPS 显示
+        if elapsed_time.as_secs_f64() >= 1.0 {
+            let calculated_fps = frame_count_since_last_update as f64 / elapsed_time.as_secs_f64();
+            fps_display_text = format!("FPS: {:.2}", calculated_fps); // 直接使用计算结果
+            frame_count_since_last_update = 0;
+            last_fps_update_time = Instant::now();
         }
 
         // 1. 颜色空间转换 BGR -> RGB
@@ -205,6 +241,23 @@ fn process_video_source(
                 0.8,
                 core::Scalar::new(255.0, 0.0, 0.0, 0.0),
                 2,
+                imgproc::LINE_8,
+                false,
+            )?;
+        }
+
+        if !args.headless {
+            // 只有在非无头模式下才需要绘制和显示
+            let org = core::Point::new(10, 30); // 绘制位置 (左上角，稍微偏移)
+            let color = core::Scalar::new(0.0, 255.0, 0.0, 0.0); // 绿色
+            imgproc::put_text(
+                &mut frame,
+                &fps_display_text,
+                org,
+                imgproc::FONT_HERSHEY_SIMPLEX, // 字体
+                1.0,                           // 字体大小
+                color,
+                2, // 字体粗细
                 imgproc::LINE_8,
                 false,
             )?;
