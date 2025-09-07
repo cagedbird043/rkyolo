@@ -183,49 +183,6 @@ impl RknnContext {
         )
     }
 
-    /// 通用的张量属性查询方法（私有）。
-    ///
-    /// # Arguments
-    ///
-    /// * `count` - 要查询的张量数量
-    /// * `query_cmd` - RKNN 查询命令（输入或输出）
-    ///
-    /// # Returns
-    ///
-    /// 成功时返回 `Ok(Vec<rknn_tensor_attr>)`，失败时返回 `Err(error_code)`。
-    fn query_tensor_attrs(
-        &self,
-        count: usize,
-        query_cmd: raw::_rknn_query_cmd,
-    ) -> Result<Vec<raw::rknn_tensor_attr>, i32> {
-        // 1. 创建一个 Vec 用于存放结果，并预分配容量
-        let mut attrs = Vec::with_capacity(count);
-
-        // 2. 循环查询每个张量的属性
-        for i in 0..count {
-            let mut attr: raw::rknn_tensor_attr = unsafe { std::mem::zeroed() };
-            // 关键：设置要查询的张量的索引
-            attr.index = i as u32;
-
-            let ret = unsafe {
-                raw::rknn_query(
-                    self.ctx,
-                    query_cmd,
-                    &mut attr as *mut _ as *mut std::ffi::c_void,
-                    std::mem::size_of::<raw::rknn_tensor_attr>() as u32,
-                )
-            };
-
-            if ret != raw::RKNN_SUCC as i32 {
-                // 如果任何一次查询失败，立即返回错误
-                return Err(ret);
-            }
-            attrs.push(attr);
-        }
-
-        Ok(attrs)
-    }
-
     /// 为模型设置单个输入张量的数据（标准、非零拷贝方式）。
     ///
     /// 这个方法是对 `rknn_inputs_set` 的一个简化封装，专门用于只有一个输入的模型。
@@ -276,6 +233,55 @@ impl RknnContext {
         }
     }
 
+    /// 获取模型的输出结果。
+    ///
+    /// 此方法调用 `rknn_outputs_get` 来获取由 NPU 计算出的所有输出张量。
+    ///
+    /// # Returns
+    /// 成功时返回 `Ok(RknnOutputs)`，这是一个管理输出缓冲区的安全封装。
+    /// 失败时返回 `Err(error_code)`。
+    pub fn get_outputs(&mut self) -> Result<RknnOutputs, i32> {
+        // 1. 查询输出张量的数量，以确定需要准备多大的 outputs 数组
+        let io_num = self.query_io_num()?;
+        let num_outputs = io_num.n_output as usize;
+
+        // 2. 创建一个 Vec<rknn_output>。这里需要特别注意：
+        //    我们需要一个由未初始化内存构成的 Vec，因为 C API 会负责填充它。
+        let mut outputs: Vec<raw::rknn_output> = Vec::with_capacity(num_outputs);
+        unsafe {
+            outputs.set_len(num_outputs);
+        }
+
+        // 我们需要告诉 get 函数，我们希望它为我们分配内存
+        for output in outputs.iter_mut() {
+            output.is_prealloc = 0; // 0 表示 false
+                                    // 如果模型是量化模型，我们通常希望得到浮点数结果用于后处理
+            output.want_float = 1; // 1 表示 true
+        }
+
+        // 3. 调用底层的 FFI 函数
+        let ret = unsafe {
+            raw::rknn_outputs_get(
+                self.ctx,
+                num_outputs as u32,
+                outputs.as_mut_ptr(),
+                std::ptr::null_mut(), // extend 参数未使用
+            )
+        };
+
+        // 4. 检查结果
+        if ret == raw::RKNN_SUCC as i32 {
+            // 成功：创建一个 RknnOutputs 实例来管理这些输出
+            Ok(RknnOutputs {
+                outputs,
+                ctx: self.ctx,
+            })
+        } else {
+            // 失败：返回错误码
+            Err(ret)
+        }
+    }
+
     pub fn run(&mut self) -> Result<(), i32> {
         let ret = unsafe { raw::rknn_run(self.ctx, std::ptr::null_mut()) };
 
@@ -284,6 +290,49 @@ impl RknnContext {
         } else {
             Err(ret)
         }
+    }
+
+    /// 通用的张量属性查询方法（私有）。
+    ///
+    /// # Arguments
+    ///
+    /// * `count` - 要查询的张量数量
+    /// * `query_cmd` - RKNN 查询命令（输入或输出）
+    ///
+    /// # Returns
+    ///
+    /// 成功时返回 `Ok(Vec<rknn_tensor_attr>)`，失败时返回 `Err(error_code)`。
+    fn query_tensor_attrs(
+        &self,
+        count: usize,
+        query_cmd: raw::_rknn_query_cmd,
+    ) -> Result<Vec<raw::rknn_tensor_attr>, i32> {
+        // 1. 创建一个 Vec 用于存放结果，并预分配容量
+        let mut attrs = Vec::with_capacity(count);
+
+        // 2. 循环查询每个张量的属性
+        for i in 0..count {
+            let mut attr: raw::rknn_tensor_attr = unsafe { std::mem::zeroed() };
+            // 关键：设置要查询的张量的索引
+            attr.index = i as u32;
+
+            let ret = unsafe {
+                raw::rknn_query(
+                    self.ctx,
+                    query_cmd,
+                    &mut attr as *mut _ as *mut std::ffi::c_void,
+                    std::mem::size_of::<raw::rknn_tensor_attr>() as u32,
+                )
+            };
+
+            if ret != raw::RKNN_SUCC as i32 {
+                // 如果任何一次查询失败，立即返回错误
+                return Err(ret);
+            }
+            attrs.push(attr);
+        }
+
+        Ok(attrs)
     }
 }
 
@@ -302,6 +351,31 @@ impl Drop for RknnContext {
         println!("Dropping RknnContext and calling rknn_destroy...");
         unsafe {
             raw::rknn_destroy(self.ctx);
+        }
+    }
+}
+
+/// 一个安全封装，用于管理由 `rknn_outputs_get` 分配的输出张量。
+///
+/// 这个结构体“拥有” RKNN 输出缓冲区，并遵循 RAII 原则。
+/// 当 `RknnOutputs` 实例离开作用域时，它会自动调用 `rknn_outputs_release`
+/// 来释放底层内存，从而防止内存泄漏。
+pub struct RknnOutputs {
+    /// 持有从 C API 返回的 rknn_output 结构体数组。
+    outputs: Vec<raw::rknn_output>,
+    /// 持有分配这些输出的上下文句柄，以便在 Drop 时可以正确释放。
+    ctx: raw::rknn_context,
+}
+
+impl Drop for RknnOutputs {
+    fn drop(&mut self) {
+        println!("Dropping RknnOutputs and calling rknn_outputs_release...");
+        unsafe {
+            raw::rknn_outputs_release(
+                self.ctx,
+                self.outputs.len() as u32,
+                self.outputs.as_mut_ptr(),
+            );
         }
     }
 }
