@@ -8,3 +8,4 @@ rknn-ffi = { path = "../rknn-ffi" }
 image = "0.25.8"
 imageproc = "0.25.0"
 rusttype = "0.9.3"
+ab_glyph = "*"

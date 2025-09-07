@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rknn-ffi = { path = "../rknn-ffi" }
-image = "0.25.8"
-imageproc = "0.25.0"
-rusttype = "0.9.3"
-ab_glyph = "*"
+rkyolo-core = { path = "../rkyolo-core" }
 clap = { version = "4.5.4", features = ["derive"] }
 walkdir = "2.5.0"

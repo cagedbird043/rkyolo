@@ -1200,12 +1200,8 @@ dependencies = [
 name = "rkyolo-app"
 version = "0.1.0"
 dependencies = [
- "ab_glyph",
  "clap",
- "image",
- "imageproc",
- "rknn-ffi",
- "rusttype",
+ "rkyolo-core",
  "walkdir",
 ]
 
@@ -1213,6 +1209,7 @@ dependencies = [
 name = "rkyolo-core"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "image",
  "imageproc",
  "rknn-ffi",
