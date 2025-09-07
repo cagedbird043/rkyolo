@@ -225,6 +225,66 @@ impl RknnContext {
 
         Ok(attrs)
     }
+
+    /// 为模型设置单个输入张量的数据（标准、非零拷贝方式）。
+    ///
+    /// 这个方法是对 `rknn_inputs_set` 的一个简化封装，专门用于只有一个输入的模型。
+    /// 数据将被拷贝到 NPU 的内部缓冲区。
+    ///
+    /// # Arguments
+    /// * `index` - 输入张量的索引，通常为 0。
+    /// * `input_type` - 输入数据的张量类型，例如 `raw::rknn_tensor_type_RKNN_TENSOR_UINT8`。
+    /// * `input_format` - 输入数据的张量格式，例如 `raw::_rknn_tensor_format_RKNN_TENSOR_NHWC`。
+    /// * `data` - 包含输入数据的字节切片。
+    ///
+    /// # Returns
+    /// 成功时返回 `Ok(())`，失败时返回 `Err(error_code)`。
+    pub fn set_input(
+        &mut self,
+        index: u32,
+        input_type: raw::rknn_tensor_type,
+        input_format: raw::rknn_tensor_format,
+        data: &[u8],
+    ) -> Result<(), i32> {
+        // 1. 构建一个 rknn_input 结构体实例
+        let rknn_input = raw::rknn_input {
+            index,
+            buf: data.as_ptr() as *mut std::ffi::c_void,
+            size: data.len() as u32,
+            pass_through: 0, // 0 表示需要驱动进行类型和格式转换
+            type_: input_type,
+            fmt: input_format,
+        };
+
+        // 2. 将单个结构体放入一个数组中，因为 C API 需要一个数组指针
+        let inputs = [rknn_input];
+
+        // 3. 调用底层的 FFI 函数
+        let ret = unsafe {
+            raw::rknn_inputs_set(
+                self.ctx,
+                inputs.len() as u32, // n_inputs, 这里是 1
+                inputs.as_ptr() as *mut raw::rknn_input,
+            )
+        };
+
+        // 4. 检查结果
+        if ret == raw::RKNN_SUCC as i32 {
+            Ok(())
+        } else {
+            Err(ret)
+        }
+    }
+
+    pub fn run(&mut self) -> Result<(), i32> {
+        let ret = unsafe { raw::rknn_run(self.ctx, std::ptr::null_mut()) };
+
+        if ret == raw::RKNN_SUCC as i32 {
+            Ok(())
+        } else {
+            Err(ret)
+        }
+    }
 }
 
 /// 为 RknnContext 实现 Drop trait，以确保资源自动释放。
