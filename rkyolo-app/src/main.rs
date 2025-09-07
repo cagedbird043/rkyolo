@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::Path;
+mod postprocess;
 
 /// 自定义错误类型，用于封装来自 RKNN FFI 调用的 i32 错误码。
 #[derive(Debug)]
@@ -90,12 +91,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- 7. 获取输出 ---
     println!("正在获取输出...");
-    let outputs = ctx.get_outputs().map_err(RknnError)?;
-    println!("成功获取 {} 个输出张量。", outputs.all().len());
+    let outputs_obj = ctx.get_outputs().map_err(RknnError)?; // 重命名以示区分
+    let output_attrs = ctx.query_output_attrs().map_err(RknnError)?;
+    println!("成功获取 {} 个输出张量。", outputs_obj.all().len());
 
-    // 暂时只打印每个输出的大小
-    for (i, output) in outputs.all().iter().enumerate() {
-        println!("  - 输出 {}: 大小 = {} 字节", i, output.size);
+    // --- 8. 准备后处理函数的输入 ---
+    // 从 RknnOutputs 对象中提取出原始的字节切片
+    let outputs_data: Vec<&[u8]> = outputs_obj
+        .all()
+        .iter()
+        .map(|o| unsafe { std::slice::from_raw_parts(o.buf as *const u8, o.size as usize) })
+        .collect();
+
+    // --- 9. 执行后处理 ---
+    let detections = postprocess::post_process_i8(
+        &outputs_data, // 传递切片引用
+        &output_attrs,
+        0.25, // conf_threshold
+        0.45, // nms_threshold
+    );
+
+    // --- 10. 打印结果 ---
+    for det in &detections {
+        println!(
+            "类别: {}, 置信度: {:.2}, 框: {:?}",
+            det.class_id, det.confidence, det.bbox
+        );
     }
 
     println!("Demo 运行结束。");

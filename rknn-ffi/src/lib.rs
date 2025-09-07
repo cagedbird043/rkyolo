@@ -258,7 +258,7 @@ impl RknnContext {
 
             output.is_prealloc = 0; // 0 表示 false
                                     // 如果模型是量化模型，我们通常希望得到浮点数结果用于后处理
-            output.want_float = 1; // 1 表示 true
+            output.want_float = 0; // 1 表示 true
         }
 
         // 3. 调用底层的 FFI 函数
