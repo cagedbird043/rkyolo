@@ -253,7 +253,9 @@ impl RknnContext {
         }
 
         // 我们需要告诉 get 函数，我们希望它为我们分配内存
-        for output in outputs.iter_mut() {
+        for (i, output) in outputs.iter_mut().enumerate() {
+            output.index = i as u32; // <-- 修正：明确指定要获取哪个输出
+
             output.is_prealloc = 0; // 0 表示 false
                                     // 如果模型是量化模型，我们通常希望得到浮点数结果用于后处理
             output.want_float = 1; // 1 表示 true
@@ -365,6 +367,16 @@ pub struct RknnOutputs {
     outputs: Vec<raw::rknn_output>,
     /// 持有分配这些输出的上下文句柄，以便在 Drop 时可以正确释放。
     ctx: raw::rknn_context,
+}
+
+impl RknnOutputs {
+    /// 返回一个对底层 `rknn_output` 结构体切片的引用。
+    ///
+    /// 这允许用户安全地只读访问所有输出张量的信息，
+    /// 而不暴露 `Vec` 的可变性或所有权。
+    pub fn all(&self) -> &[raw::rknn_output] {
+        &self.outputs
+    }
 }
 
 impl Drop for RknnOutputs {
