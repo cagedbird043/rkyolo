@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rkyolo_core::{
     RknnContext, RknnError, draw_results, image, load_labels, post_process_i8,
     preprocess_letterbox_quantize, rknn_ffi,
@@ -7,6 +7,14 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+/// 定义支持的语言选项
+#[derive(ValueEnum, Clone, Debug, Default)]
+enum Lang {
+    #[default]
+    En, // 英文
+    Zh, // 中文
+}
 
 /// 一个使用 Rust 和 Rockchip NPU 进行 YOLO 模型推理的应用
 #[derive(Parser, Debug)]
@@ -35,9 +43,17 @@ struct Args {
     /// NMS (非极大值抑制) 的 IoU 阈值
     #[arg(long, default_value_t = 0.45)]
     iou_thresh: f32,
+
+    /// 增加日志详细程度 (-v -> info, -vv -> debug, -vvv -> trace)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// 设置日志和输出信息的语言
+    #[arg(long, value_enum, default_value_t = Lang::En)]
+    lang: Lang,
 }
 
-/// 【新增】处理单张图片的完整流程
+/// 处理单张图片的完整流程
 fn process_single_image(
     ctx: &mut RknnContext,
     image_path: &Path,
@@ -112,7 +128,9 @@ fn process_single_image(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 解析命令行参数
     let args = Args::parse();
+    // 注意：我们稍后会用 log::debug! 宏来替换下面的 println!
     println!("配置参数: {:?}", args);
+
     // --- 2. 使用解析出的路径 ---
     let model_path = Path::new(&args.model);
     let input_path = Path::new(&args.input);
