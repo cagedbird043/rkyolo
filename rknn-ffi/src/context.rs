@@ -280,6 +280,46 @@ impl RknnContext {
         }
     }
 
+    /// 【新增】查询所有输入张量的原生（硬件）属性。
+    /// 这是实现零拷贝所必需的，因为它能提供硬件最优的布局信息，特别是 `size_with_stride`。
+    pub fn query_native_input_attrs(&self) -> Result<Vec<raw::rknn_tensor_attr>, i32> {
+        let io_num = self.query_io_num()?;
+        self.query_tensor_attrs(
+            io_num.n_input as usize,
+            raw::_rknn_query_cmd_RKNN_QUERY_NATIVE_INPUT_ATTR,
+        )
+    }
+
+    /// 【新增】创建一个由 RKNN 管理的 DMA 内存缓冲区。
+    /// 这个函数是对 `rknn_create_mem` 的安全封装，返回一个遵循 RAII 的 RknnTensorMem 实例。
+    pub fn create_mem(&mut self, size: u32) -> Result<crate::mem::RknnTensorMem, i32> {
+        let mem_ptr = unsafe { raw::rknn_create_mem(self.ctx, size) };
+        if mem_ptr.is_null() {
+            // rknn_create_mem 失败时通常返回 NULL，我们将其转换为一个错误码
+            Err(raw::RKNN_ERR_MALLOC_FAIL)
+        } else {
+            Ok(crate::mem::RknnTensorMem {
+                mem: mem_ptr,
+                ctx: self.ctx,
+            })
+        }
+    }
+
+    /// 【新增】将一个 DMA 内存缓冲区绑定到一个输入或输出张量。
+    /// 这是激活零拷贝模式的关键步骤。
+    pub fn set_io_mem(
+        &mut self,
+        mem: &crate::mem::RknnTensorMem,
+        attr: &raw::rknn_tensor_attr,
+    ) -> Result<(), i32> {
+        let ret = unsafe { raw::rknn_set_io_mem(self.ctx, mem.mem, attr as *const _ as *mut _) };
+        if ret == raw::RKNN_SUCC as i32 {
+            Ok(())
+        } else {
+            Err(ret)
+        }
+    }
+    
     /// 通用的张量属性查询方法（私有）。
     ///
     /// # Arguments

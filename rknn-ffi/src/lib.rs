@@ -18,6 +18,7 @@ pub mod raw {
 // 3. 重新导出 (re-export) 公共 API
 pub use context::RknnContext;
 pub use io::RknnOutputs;
+pub use mem::RknnTensorMem;
 pub use utils::get_type_string;
 
 // 注意：我们暂时不导出 RknnTensorMem，因为它还不存在

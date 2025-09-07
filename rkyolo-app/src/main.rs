@@ -1,15 +1,29 @@
 use clap::Parser;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use rkyolo_core::rknn_ffi::raw::rknn_tensor_attr;
 use rkyolo_core::{
     Detection, Lang, RknnContext, RknnError, draw_results, get_type_string, image, load_labels,
-    post_process_i8, preprocess_letterbox_quantize, rknn_ffi,
+    post_process_i8, preprocess_letterbox_quantize, preprocess_letterbox_quantize_zero_copy,
+    rknn_ffi,
 };
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+enum ExecutionMode {
+    /// 零拷贝模式。
+    /// 它需要拥有为输入分配的 DMA 内存 (`input_mem`)，
+    /// 以及描述该内存布局的硬件原生属性 (`input_attr`)，特别是 w_stride。
+    ZeroCopy {
+        input_mem: rknn_ffi::RknnTensorMem,
+        input_attr: rknn_ffi::raw::rknn_tensor_attr,
+    },
+    /// 标准拷贝模式。
+    /// 这种模式是无状态的，每次推理前都会通过 `rknn_inputs_set` 传递数据。
+    Standard,
+}
 
 /// 一个使用 Rust 和 Rockchip NPU 进行 YOLO 模型推理的应用
 #[derive(Parser, Debug)]
@@ -46,6 +60,10 @@ struct Args {
     /// 设置日志和输出信息的语言
     #[arg(long, value_enum, default_value_t = rkyolo_core::Lang::En)]
     lang: Lang,
+
+    /// 设置是否禁用零拷贝模式，强制使用标准拷贝模式
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    disable_zero_copy: bool,
 }
 
 /// 【新增】辅助函数：记录检测结果摘要
@@ -125,39 +143,67 @@ fn log_tensor_attrs(attrs: &[rknn_tensor_attr], name_en: &str, name_zh: &str, la
 /// 处理单张图片的完整流程
 fn process_single_image(
     ctx: &mut RknnContext,
+    mode: &mut ExecutionMode, // <--- 新增参数
     image_path: &Path,
     labels: &[String],
     args: &Args,
 ) -> Result<(), Box<dyn Error>> {
     let mut original_image = image::open(image_path)?.to_rgb8();
 
-    let input_attrs = ctx.query_input_attrs().map_err(RknnError::from)?;
-    let input_attr = &input_attrs[0];
-    let (model_height, model_width, _) =
-        if input_attr.fmt == rknn_ffi::raw::_rknn_tensor_format_RKNN_TENSOR_NHWC {
-            (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3])
-        } else {
-            (input_attr.dims[2], input_attr.dims[3], input_attr.dims[1])
-        };
+    let letterbox_info = match mode {
+        ExecutionMode::ZeroCopy {
+            input_mem,
+            input_attr,
+        } => {
+            let (model_height, model_width, _) =
+                if input_attr.fmt == rknn_ffi::raw::_rknn_tensor_format_RKNN_TENSOR_NHWC {
+                    (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3])
+                } else {
+                    (input_attr.dims[2], input_attr.dims[3], input_attr.dims[1])
+                };
 
-    let (image_data_i8, letterbox_info) = preprocess_letterbox_quantize(
-        image_path,
-        model_width,
-        model_height,
-        input_attr.zp,
-        input_attr.scale,
-    )?;
-
-    let image_data_u8: &[u8] = unsafe {
-        std::slice::from_raw_parts(image_data_i8.as_ptr() as *const u8, image_data_i8.len())
+            let buffer = input_mem.as_mut_slice();
+            let info = preprocess_letterbox_quantize_zero_copy(
+                image_path,
+                model_width,
+                model_height,
+                input_attr.w_stride,
+                input_attr.zp,
+                input_attr.scale,
+                buffer,
+            )?;
+            // 零拷贝模式下，不需要调用 ctx.set_input()
+            info
+        }
+        ExecutionMode::Standard => {
+            let input_attrs = ctx.query_input_attrs().map_err(RknnError::from)?;
+            let input_attr = &input_attrs[0];
+            let (model_height, model_width, _) =
+                if input_attr.fmt == rknn_ffi::raw::_rknn_tensor_format_RKNN_TENSOR_NHWC {
+                    (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3])
+                } else {
+                    (input_attr.dims[2], input_attr.dims[3], input_attr.dims[1])
+                };
+            let (image_data_i8, info) = preprocess_letterbox_quantize(
+                image_path,
+                model_width,
+                model_height,
+                input_attr.zp,
+                input_attr.scale,
+            )?;
+            let image_data_u8: &[u8] = unsafe {
+                std::slice::from_raw_parts(image_data_i8.as_ptr() as *const u8, image_data_i8.len())
+            };
+            ctx.set_input(
+                0,
+                rknn_ffi::raw::_rknn_tensor_type_RKNN_TENSOR_INT8,
+                input_attr.fmt,
+                image_data_u8,
+            )
+            .map_err(RknnError)?;
+            info
+        }
     };
-    ctx.set_input(
-        0,
-        rknn_ffi::raw::_rknn_tensor_type_RKNN_TENSOR_INT8,
-        input_attr.fmt,
-        image_data_u8,
-    )
-    .map_err(RknnError)?;
     ctx.run().map_err(RknnError)?;
 
     let outputs_obj = ctx.get_outputs().map_err(RknnError)?;
@@ -217,6 +263,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let model_data = fs::read(model_path)?;
     let mut ctx = RknnContext::new(&model_data, 0, None).map_err(RknnError)?;
+    let mut execution_mode = if args.disable_zero_copy {
+        match args.lang {
+            Lang::En => info!("Zero-copy mode is disabled by command line argument."),
+            Lang::Zh => info!("零拷贝模式已通过命令行参数禁用。"),
+        }
+        ExecutionMode::Standard
+    } else {
+        try_setup_zero_copy(&mut ctx, &args.lang)?
+    }; // let mut execution_mode = ExecutionMode::Standard;
     let labels = load_labels(labels_path)?;
 
     // 【新增】打印模型信息摘要
@@ -241,7 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Lang::En => info!("\nProcessing single image: {:?}", input_path),
             Lang::Zh => info!("\n处理单张图片: {:?}", input_path),
         }
-        process_single_image(&mut ctx, input_path, &labels, &args)?;
+        process_single_image(&mut ctx, &mut execution_mode, input_path, &labels, &args)?;
     } else if input_path.is_dir() {
         fs::create_dir_all(output_path)?;
         match args.lang {
@@ -258,7 +313,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Lang::En => info!("\n--- Processing image: {:?} ---", path),
                             Lang::Zh => info!("\n--- 正在处理图片: {:?} ---", path),
                         }
-                        if let Err(e) = process_single_image(&mut ctx, path, &labels, &args) {
+                        if let Err(e) = process_single_image(
+                            &mut ctx,
+                            &mut execution_mode,
+                            path,
+                            &labels,
+                            &args,
+                        ) {
                             match args.lang {
                                 Lang::En => error!("Error processing file {:?}: {}", path, e),
                                 Lang::Zh => error!("处理文件 {:?} 时发生错误: {}", path, e),
@@ -282,4 +343,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Lang::Zh => info!("\n所有任务已完成。"),
     }
     Ok(())
+}
+
+/// 尝试设置零拷贝执行模式。
+/// 如果成功，返回配置好的 ZeroCopy 模式。
+/// 如果失败，打印警告并返回 Standard 模式作为降级。
+fn try_setup_zero_copy(ctx: &mut RknnContext, lang: &Lang) -> Result<ExecutionMode, RknnError> {
+    // 1. 查询原生属性
+    let native_input_attrs = match ctx.query_native_input_attrs() {
+        Ok(attrs) => attrs,
+        Err(e) => {
+            match lang {
+                Lang::En => warn!(
+                    "Failed to query native input attributes (code: {}). Falling back to standard mode.",
+                    e
+                ),
+                Lang::Zh => warn!("查询原生输入属性失败 (错误码: {})。将降级到标准模式。", e),
+            }
+            return Ok(ExecutionMode::Standard);
+        }
+    };
+    // 我们只关心第一个输入
+    let input_attr = if let Some(attr) = native_input_attrs.get(0) {
+        attr.clone() // Clone attr so we can own it in ExecutionMode
+    } else {
+        match lang {
+            Lang::En => warn!("No native input attributes found. Falling back to standard mode."),
+            Lang::Zh => warn!("未找到原生输入属性。将降级到标准模式。"),
+        }
+        return Ok(ExecutionMode::Standard);
+    };
+
+    // 2. 创建 DMA 内存
+    let input_mem = match ctx.create_mem(input_attr.size_with_stride) {
+        Ok(mem) => mem,
+        Err(e) => {
+            match lang {
+                Lang::En => warn!(
+                    "Failed to create DMA memory (code: {}). Falling back to standard mode.",
+                    e
+                ),
+                Lang::Zh => warn!("创建 DMA 内存失败 (错误码: {})。将降级到标准模式。", e),
+            }
+            return Ok(ExecutionMode::Standard);
+        }
+    };
+
+    // 3. 绑定内存
+    if let Err(e) = ctx.set_io_mem(&input_mem, &input_attr) {
+        match lang {
+            Lang::En => warn!(
+                "Failed to set IO memory (code: {}). Falling back to standard mode.",
+                e
+            ),
+            Lang::Zh => warn!("设置 IO 内存失败 (错误码: {})。将降级到标准模式。", e),
+        }
+        return Ok(ExecutionMode::Standard);
+    }
+
+    // 如果所有步骤都成功
+    match lang {
+        Lang::En => info!("Successfully initialized Zero-Copy mode."),
+        Lang::Zh => info!("零拷贝模式初始化成功。"),
+    }
+    Ok(ExecutionMode::ZeroCopy {
+        input_mem,
+        input_attr,
+    })
 }
