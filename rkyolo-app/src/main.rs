@@ -75,9 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("RKNN YOLO Rust Demo - 启动");
 
     // --- 1. 定义路径 ---
-    let model_path = Path::new("./yolo11.rknn");
-    let image_path = Path::new("bus.jpg");
-    let labels_path = Path::new("coco_labels.txt");
+    let model_path = Path::new("./MTDC-MANUAL.rknn");
+    let image_path = Path::new("DJI_0002_0_0.jpg");
+    let labels_path = Path::new("tassel_labels.txt");
 
     // 加载原始图片用于绘图
     let mut original_image = image::open(image_path)?.to_rgb8();

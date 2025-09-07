@@ -2,11 +2,6 @@
 
 use crate::LetterboxInfo;
 use rknn_ffi::raw::rknn_tensor_attr;
-use std::collections::HashMap;
-
-// --- 常量定义 ---
-const OBJ_CLASS_NUM: usize = 80; // COCO 数据集有80个类别
-const PROP_BOX_SIZE: usize = OBJ_CLASS_NUM + 4; // 每个检测 proposta 的大小 (cx, cy, w, h, cls_scores...)
 
 // --- 数据结构 ---
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +17,12 @@ pub struct Detection {
     pub bbox: BoundingBox,
     pub confidence: f32,
     pub class_id: i32,
+}
+
+/// 用于临时存储已识别的张量信息
+enum TensorInfo {
+    Box { h: u32, w: u32, index: usize },
+    Score { h: u32, w: u32, index: usize },
 }
 
 // --- 辅助函数 ---
@@ -66,7 +67,6 @@ fn decode_branch(
     let grid_w = box_attr.dims[3] as usize;
     let grid_len = grid_h * grid_w;
 
-    // 【终极修正】: 类别数直接由score张量的通道数决定！
     let class_num = score_attr.dims[1] as usize;
 
     let dfl_len = box_attr.dims[1] as usize / 4;
@@ -136,72 +136,105 @@ pub fn post_process_i8(
     letterbox: LetterboxInfo,
 ) -> Vec<Detection> {
     let model_in_h = 640;
-    let output_per_branch = output_attrs.len() / 3;
-    let mut all_detections = Vec::new();
 
-    for i in 0..3 {
-        let box_idx = i * output_per_branch;
-        let score_idx = i * output_per_branch + 1;
+    // 1. 动态识别与分类：将所有输出张量识别为 Box 或 Score 类型
+    let mut identified_tensors = Vec::new();
+    for (i, attr) in output_attrs.iter().enumerate() {
+        if attr.n_dims == 4 {
+            // 我们只处理标准的4维输出
+            let c = attr.dims[1];
+            let h = attr.dims[2];
+            let w = attr.dims[3];
 
-        let box_attr = &output_attrs[box_idx];
-        let score_attr = &output_attrs[score_idx];
-
-        let box_data_u8 = outputs_data[box_idx];
-        let score_data_u8 = outputs_data[score_idx];
-
-        let box_data: &[i8] = unsafe {
-            std::slice::from_raw_parts(box_data_u8.as_ptr() as *const i8, box_data_u8.len())
-        };
-        let score_data: &[i8] = unsafe {
-            std::slice::from_raw_parts(score_data_u8.as_ptr() as *const i8, score_data_u8.len())
-        };
-
-        let stride = model_in_h / box_attr.dims[2];
-
-        let branch_detections = decode_branch(
-            box_data,
-            score_data,
-            box_attr,
-            score_attr,
-            stride,
-            conf_threshold,
-        );
-        all_detections.extend(branch_detections);
+            // 使用一个启发式规则来区分box和score张量
+            // box张量的通道数通常是固定的（例如64），而score张量的通道数等于类别数
+            if c == 64 {
+                // 这个值通常与DFL的长度有关，对于yolo11是64
+                identified_tensors.push(TensorInfo::Box { h, w, index: i });
+            } else {
+                identified_tensors.push(TensorInfo::Score { h, w, index: i });
+            }
+        }
     }
 
-    // --- 【NMS 逻辑重构】 ---
-    // 1. 按置信度对所有候选框进行一次全局降序排序
+    let mut all_detections = Vec::new();
+
+    // 2. 动态配对与解码：遍历所有识别出的Box张量，并为它们寻找匹配的Score张量
+    for tensor_info in &identified_tensors {
+        if let &TensorInfo::Box {
+            h,
+            w,
+            index: box_idx,
+        } = tensor_info
+        {
+            // 尝试寻找一个具有相同 H 和 W 维度的 Score 张量
+            let paired_score_info = identified_tensors.iter().find(|&t| {
+                if let &TensorInfo::Score { h: sh, w: sw, .. } = t {
+                    sh == h && sw == w
+                } else {
+                    false
+                }
+            });
+
+            // 3. 如果找到了配对，则进行解码
+            if let Some(&TensorInfo::Score {
+                index: score_idx, ..
+            }) = paired_score_info
+            {
+                let box_attr = &output_attrs[box_idx];
+                let score_attr = &output_attrs[score_idx];
+
+                let box_data_u8 = outputs_data[box_idx];
+                let score_data_u8 = outputs_data[score_idx];
+
+                let box_data: &[i8] = unsafe {
+                    std::slice::from_raw_parts(box_data_u8.as_ptr() as *const i8, box_data_u8.len())
+                };
+                let score_data: &[i8] = unsafe {
+                    std::slice::from_raw_parts(
+                        score_data_u8.as_ptr() as *const i8,
+                        score_data_u8.len(),
+                    )
+                };
+
+                let stride = model_in_h / box_attr.dims[2];
+
+                let branch_detections = decode_branch(
+                    box_data,
+                    score_data,
+                    box_attr,
+                    score_attr,
+                    stride,
+                    conf_threshold,
+                );
+                all_detections.extend(branch_detections);
+            }
+        }
+    }
+
+    // NMS 和坐标变换逻辑保持不变
     all_detections.sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
     let mut nms_detections = Vec::new();
     while !all_detections.is_empty() {
-        // 2. 取出当前置信度最高的框
         let best_det = all_detections.remove(0);
         nms_detections.push(best_det.clone());
-
-        // 3. 过滤掉与 best_det 重叠度高且类别相同的框
         all_detections.retain(|det| {
-            // 只有当类别相同时，才计算IoU进行抑制
             if det.class_id == best_det.class_id {
                 calculate_iou(&best_det.bbox, &det.bbox) < nms_threshold
             } else {
-                true // 不同类别，不抑制
+                true
             }
         });
     }
 
-    // --- 对经过NMS的结果进行坐标变换 ---
     let mut corrected_detections = Vec::with_capacity(nms_detections.len());
     for det in nms_detections {
-        // 注意：这里我们遍历的是 nms_detections
         let bbox = det.bbox;
-
-        // 应用Letterbox的逆运算
         let corrected_x1 = (bbox.x1 - letterbox.pad_x as f32) / letterbox.scale;
         let corrected_y1 = (bbox.y1 - letterbox.pad_y as f32) / letterbox.scale;
         let corrected_x2 = (bbox.x2 - letterbox.pad_x as f32) / letterbox.scale;
         let corrected_y2 = (bbox.y2 - letterbox.pad_y as f32) / letterbox.scale;
-
         corrected_detections.push(Detection {
             bbox: BoundingBox {
                 x1: corrected_x1,

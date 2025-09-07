@@ -4,3 +4,5 @@ yolo11.rknn
 *.jpg
 *.py
 test/
+*.rknn
+*.txt
