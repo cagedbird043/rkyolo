@@ -1,6 +1,7 @@
 //! YOLO 模型后处理模块 (INT8 版本)
 
-use crate::LetterboxInfo;
+use crate::{Lang, LetterboxInfo}; // <--- 引入 Lang
+use log::{debug, info}; // <--- 引入 log 宏
 use rknn_ffi::raw::rknn_tensor_attr;
 
 // --- 数据结构 ---
@@ -20,6 +21,7 @@ pub struct Detection {
 }
 
 /// 用于临时存储已识别的张量信息
+#[derive(Debug)] // <--- 添加 Debug trait
 enum TensorInfo {
     Box { h: u32, w: u32, index: usize },
     Score { h: u32, w: u32, index: usize },
@@ -134,8 +136,13 @@ pub fn post_process_i8(
     conf_threshold: f32,
     nms_threshold: f32,
     letterbox: LetterboxInfo,
+    lang: Lang, // <--- 新增 lang 参数
 ) -> Vec<Detection> {
     let model_in_h = 640;
+    debug!(
+        "Starting post-processing for {} outputs.",
+        output_attrs.len()
+    );
 
     // 1. 动态识别与分类：将所有输出张量识别为 Box 或 Score 类型
     let mut identified_tensors = Vec::new();
@@ -156,6 +163,7 @@ pub fn post_process_i8(
             }
         }
     }
+    debug!("Identified tensors: {:?}", identified_tensors);
 
     let mut all_detections = Vec::new();
 
@@ -183,6 +191,10 @@ pub fn post_process_i8(
             {
                 let box_attr = &output_attrs[box_idx];
                 let score_attr = &output_attrs[score_idx];
+                debug!(
+                    "Decoding branch: box_idx={}, score_idx={}, grid=({}x{})",
+                    box_idx, score_idx, h, w
+                );
 
                 let box_data_u8 = outputs_data[box_idx];
                 let score_data_u8 = outputs_data[score_idx];
@@ -211,6 +223,7 @@ pub fn post_process_i8(
             }
         }
     }
+    debug!("Found {} raw detections before NMS.", all_detections.len());
 
     // NMS 和坐标变换逻辑保持不变
     all_detections.sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
@@ -246,9 +259,16 @@ pub fn post_process_i8(
         });
     }
 
-    println!(
-        "后处理完成，共找到 {} 个最终目标（NMS后）",
-        corrected_detections.len()
-    );
+    match lang {
+        Lang::En => info!(
+            "Post-processing complete. Found {} final objects (after NMS).",
+            corrected_detections.len()
+        ),
+        Lang::Zh => info!(
+            "后处理完成，共找到 {} 个最终目标（NMS后）。",
+            corrected_detections.len()
+        ),
+    }
+
     corrected_detections
 }

@@ -1,20 +1,13 @@
-use clap::{Parser, ValueEnum};
+use clap::Parser;
+use log::{debug, error, info};
 use rkyolo_core::{
-    RknnContext, RknnError, draw_results, image, load_labels, post_process_i8,
+    Lang, RknnContext, RknnError, draw_results, image, load_labels, post_process_i8,
     preprocess_letterbox_quantize, rknn_ffi,
 };
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
-/// 定义支持的语言选项
-#[derive(ValueEnum, Clone, Debug, Default)]
-enum Lang {
-    #[default]
-    En, // 英文
-    Zh, // 中文
-}
 
 /// 一个使用 Rust 和 Rockchip NPU 进行 YOLO 模型推理的应用
 #[derive(Parser, Debug)]
@@ -49,7 +42,8 @@ struct Args {
     verbose: u8,
 
     /// 设置日志和输出信息的语言
-    #[arg(long, value_enum, default_value_t = Lang::En)]
+    #[arg(long, value_enum, default_value_t = rkyolo_core::Lang::En)]
+    // <--- 显式使用 rkyolo_core::Lang
     lang: Lang,
 }
 
@@ -60,8 +54,7 @@ fn process_single_image(
     labels: &[String],
     args: &Args,
 ) -> Result<(), Box<dyn Error>> {
-    println!("\n--- Processing Image: {:?} ---", image_path);
-
+    // 日志信息已移至 main 函数的循环中
     let mut original_image = image::open(image_path)?.to_rgb8();
 
     let input_attrs = ctx.query_input_attrs().map_err(RknnError::from)?;
@@ -107,6 +100,7 @@ fn process_single_image(
         args.conf_thresh,
         args.iou_thresh,
         letterbox_info,
+        args.lang.clone(), // <--- 传递 lang 参数
     );
 
     draw_results(&mut original_image, &detections, labels);
@@ -119,7 +113,10 @@ fn process_single_image(
         PathBuf::from(&args.output)
     };
 
-    println!("Saving result to: {:?}", output_path);
+    match args.lang {
+        Lang::En => info!("Saving result to: {:?}", output_path),
+        Lang::Zh => info!("结果保存至: {:?}", output_path),
+    }
     original_image.save(&output_path)?;
 
     Ok(())
@@ -128,38 +125,60 @@ fn process_single_image(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 解析命令行参数
     let args = Args::parse();
-    // 注意：我们稍后会用 log::debug! 宏来替换下面的 println!
-    println!("配置参数: {:?}", args);
 
-    // --- 2. 使用解析出的路径 ---
+    // 2.【新增】根据命令行参数初始化日志系统
+    let log_level = match args.verbose {
+        0 => log::LevelFilter::Warn,
+        1 => log::LevelFilter::Info,
+        2 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    };
+    env_logger::Builder::new().filter_level(log_level).init();
+
+    debug!("Parsed command line arguments: {:?}", args);
+
+    // --- 使用解析出的路径 ---
     let model_path = Path::new(&args.model);
     let input_path = Path::new(&args.input);
     let labels_path = Path::new(&args.labels);
     let output_path = Path::new(&args.output);
 
-    // --- 1. 初始化模型和标签 ---
+    // --- 初始化模型和标签 ---
     let model_data = fs::read(model_path)?;
     let mut ctx = RknnContext::new(&model_data, 0, None).map_err(RknnError)?;
     let labels = load_labels(labels_path)?;
 
-    // --- 2. 判断输入是文件还是目录 ---
+    // --- 判断输入是文件还是目录 ---
     if input_path.is_file() {
         if output_path.is_dir() {
-            // 如果输出是目录，确保它存在
             fs::create_dir_all(output_path)?;
+        }
+        match args.lang {
+            Lang::En => info!("Processing single image: {:?}", input_path),
+            Lang::Zh => info!("处理单张图片: {:?}", input_path),
         }
         process_single_image(&mut ctx, input_path, &labels, &args)?;
     } else if input_path.is_dir() {
-        // 确保输出目录存在
         fs::create_dir_all(output_path)?;
+        match args.lang {
+            Lang::En => info!("Processing all images in directory: {:?}", input_path),
+            Lang::Zh => info!("处理目录中的所有图片: {:?}", input_path),
+        }
 
         for entry in WalkDir::new(input_path).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
             if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                 match ext.to_lowercase().as_str() {
                     "jpg" | "jpeg" | "png" | "bmp" => {
+                        match args.lang {
+                            Lang::En => info!("\n--- Processing image: {:?} ---", path),
+                            Lang::Zh => info!("\n--- 正在处理图片: {:?} ---", path),
+                        }
                         if let Err(e) = process_single_image(&mut ctx, path, &labels, &args) {
-                            eprintln!("Error processing file {:?}: {}", path, e);
+                            match args.lang {
+                                Lang::En => error!("Error processing file {:?}: {}", path, e),
+                                Lang::Zh => error!("处理文件 {:?} 时发生错误: {}", path, e),
+                            }
                         }
                     }
                     _ => {}
@@ -167,13 +186,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        return Err(format!(
+        let err_msg = format!(
             "Input path not found or is not a file/directory: {}",
             args.input
-        )
-        .into());
+        );
+        // 使用 error! 宏记录错误，然后返回它
+        error!("{}", &err_msg);
+        return Err(err_msg.into());
     }
-
-    println!("\nAll tasks completed.");
+    match args.lang {
+        Lang::En => info!("\nAll tasks completed."),
+        Lang::Zh => info!("\n所有任务已完成。"),
+    }
     Ok(())
 }

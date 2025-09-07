@@ -4,6 +4,7 @@ mod postprocess;
 pub use drawing::{draw_results, load_labels};
 pub use image;
 pub use image::{Rgb, RgbImage, imageops, open};
+pub use log::{debug, trace}; // <--- 新增
 pub use postprocess::{BoundingBox, Detection, post_process_i8};
 pub use rknn_ffi;
 pub use rknn_ffi::RknnContext;
@@ -11,6 +12,14 @@ pub use rknn_ffi::RknnContext;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
+
+/// 【新增】定义支持的语言选项，作为公共API
+#[derive(Clone, Debug, Default, clap::ValueEnum)]
+pub enum Lang {
+    #[default]
+    En, // 英文
+    Zh, // 中文
+}
 
 /// 存储 Letterbox 预处理的相关信息
 #[derive(Debug, Clone, Copy)]
@@ -58,14 +67,26 @@ pub fn preprocess_letterbox_quantize(
     // 1. Letterbox 几何变换
     let img = image::open(image_path)?.to_rgb8();
     let (original_w, original_h) = img.dimensions();
+    debug!(
+        "Preprocessing image: original_dims=({}x{}), target_dims=({}x{})",
+        original_w, original_h, target_width, target_height
+    );
+
     let scale_val =
         (target_width as f32 / original_w as f32).min(target_height as f32 / original_h as f32);
     let new_w = (original_w as f32 * scale_val) as u32;
     let new_h = (original_h as f32 * scale_val) as u32;
+    trace!(
+        "Calculated scale: {}, new_dims: ({}x{})",
+        scale_val, new_w, new_h
+    );
+
     let resized_img = imageops::resize(&img, new_w, new_h, imageops::FilterType::Triangle);
     let mut canvas = RgbImage::from_pixel(target_width, target_height, Rgb([114, 114, 114]));
     let pad_x = (target_width - new_w) / 2;
     let pad_y = (target_height - new_h) / 2;
+    trace!("Padding: x={}, y={}", pad_x, pad_y);
+
     imageops::overlay(&mut canvas, &resized_img, pad_x.into(), pad_y.into());
     let info = LetterboxInfo {
         scale: scale_val,
@@ -73,6 +94,7 @@ pub fn preprocess_letterbox_quantize(
         pad_y,
     };
     let u8_data = canvas.into_raw();
+    debug!("Image letterboxed and converted to raw u8 buffer.");
 
     // 2. 【关键】手动归一化并量化
     let i8_data: Vec<i8> = u8_data
@@ -85,6 +107,7 @@ pub fn preprocess_letterbox_quantize(
             q_val.clamp(i8::MIN as i32, i8::MAX as i32) as i8
         })
         .collect();
+    debug!("Quantization complete. ZP={}, Scale={}", zp, scale);
 
     Ok((i8_data, info))
 }
