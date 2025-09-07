@@ -1,1 +1,3 @@
-workspace = { members = ["rknn-ffi", "rkyolo-app"] }
+[workspace]
+members = ["rknn-ffi", "rkyolo-app", "rkyolo-core"]
+resolver = "2"
