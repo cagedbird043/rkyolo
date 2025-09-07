@@ -245,6 +245,9 @@ version = "0.1.0"
 [[package]]
 name = "rkyolo-app"
 version = "0.1.0"
+dependencies = [
+ "rknn-ffi",
+]
 
 [[package]]
 name = "rustc-hash"
