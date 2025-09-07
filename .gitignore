@@ -1,8 +1,7 @@
 /target
-bus.jpg
-yolo11.rknn
-*.jpg
 *.py
 test/
-*.rknn
-*.txt
+MTDC-UAV.rknn
+tassel_labels.txt
+DJI_0002_0_0.jpg
+output.jpg

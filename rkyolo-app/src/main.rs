@@ -1,11 +1,41 @@
+use clap::Parser;
 use image::{Rgb, RgbImage, imageops};
 use rknn_ffi::RknnContext;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::path::Path; // 确保 RgbImage 和 Rgb 被导入
+use std::path::Path;
 mod drawing;
 mod postprocess;
+
+/// 一个使用 Rust 和 Rockchip NPU 进行 YOLO 模型推理的应用
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// .rknn 模型文件的路径
+    #[arg(short, long, default_value = "yolo11.rknn")]
+    model: String,
+
+    /// 要进行检测的输入图片路径
+    #[arg(short, long, default_value = "bus.jpg")]
+    image: String,
+
+    /// 包含类别名称的标签文件路径
+    #[arg(short, long, default_value = "coco_labels.txt")]
+    labels: String,
+
+    /// 输出结果图片的保存路径
+    #[arg(short, long, default_value = "output.jpg")]
+    output: String,
+
+    /// 置信度阈值
+    #[arg(long, default_value_t = 0.25)]
+    conf_thresh: f32,
+
+    /// NMS (非极大值抑制) 的 IoU 阈值
+    #[arg(long, default_value_t = 0.45)]
+    iou_thresh: f32,
+}
 
 /// 存储 Letterbox 预处理的相关信息
 #[derive(Debug, Clone, Copy)]
@@ -72,12 +102,16 @@ fn preprocess_letterbox_quantize(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 解析命令行参数
+    let args = Args::parse();
+    println!("配置参数: {:?}", args);
+
     println!("RKNN YOLO Rust Demo - 启动");
 
-    // --- 1. 定义路径 ---
-    let model_path = Path::new("./MTDC-MANUAL.rknn");
-    let image_path = Path::new("DJI_0002_0_0.jpg");
-    let labels_path = Path::new("tassel_labels.txt");
+    // --- 2. 使用解析出的路径 ---
+    let model_path = Path::new(&args.model);
+    let image_path = Path::new(&args.image);
+    let labels_path = Path::new(&args.labels);
 
     // 加载原始图片用于绘图
     let mut original_image = image::open(image_path)?.to_rgb8();
@@ -137,21 +171,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_attrs = ctx.query_output_attrs().map_err(RknnError)?;
     println!("成功获取 {} 个输出张量。", outputs_obj.all().len());
 
-    // --- 诊断信息：打印输出张量的维度 ---
-    println!("--- 输出张量属性诊断 ---");
-    for (i, attr) in output_attrs.iter().enumerate() {
-        println!(
-            "  - Attr {}: name={}, fmt={:?}, dims=[{}, {}, {}, {}]",
-            i,
-            std::str::from_utf8(&attr.name).unwrap_or(""), // C字符串转Rust字符串
-            attr.fmt,
-            attr.dims[0],
-            attr.dims[1],
-            attr.dims[2],
-            attr.dims[3]
-        );
-    }
-    println!("--------------------------");
+    // // --- 诊断信息：打印输出张量的维度 ---
+    // println!("--- 输出张量属性诊断 ---");
+    // for (i, attr) in output_attrs.iter().enumerate() {
+    //     println!(
+    //         "  - Attr {}: name={}, fmt={:?}, dims=[{}, {}, {}, {}]",
+    //         i,
+    //         std::str::from_utf8(&attr.name).unwrap_or(""), // C字符串转Rust字符串
+    //         attr.fmt,
+    //         attr.dims[0],
+    //         attr.dims[1],
+    //         attr.dims[2],
+    //         attr.dims[3]
+    //     );
+    // }
+    // println!("--------------------------");
 
     // --- 8. 准备后处理函数的输入 ---
     // 从 RknnOutputs 对象中提取出原始的字节切片
@@ -165,8 +199,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let detections = postprocess::post_process_i8(
         &outputs_data,
         &output_attrs,
-        0.25,
-        0.45,
+        args.conf_thresh,
+        args.iou_thresh,
         letterbox_info, // <-- 新增参数
     );
 
@@ -192,8 +226,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("正在将检测结果绘制到图片上...");
     drawing::draw_results(&mut original_image, &detections, &labels);
 
-    // --- 12. 保存结果图片 ---
-    let output_path = Path::new("output.jpg");
+    // --- 12. 保存结果图片到指定的输出路径 ---
+    let output_path = Path::new(&args.output);
     println!("正在保存结果图片到: {:?}", output_path);
     original_image.save(output_path)?;
     println!("结果已保存！");

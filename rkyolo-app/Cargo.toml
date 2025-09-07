@@ -9,3 +9,4 @@ image = "0.25.8"
 imageproc = "0.25.0"
 rusttype = "0.9.3"
 ab_glyph = "*"
+clap = { version = "4.5.4", features = ["derive"] }
