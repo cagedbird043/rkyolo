@@ -138,17 +138,71 @@ impl RknnContext {
     /// 查询所有输入张量的属性。
     ///
     /// # Returns
-    /// 成功时返回 `Ok(Vec<rknn_tensor_attr>)`，失败时返回 `Err(error_code)`。
+    ///
+    /// 成功时返回 `Ok(Vec<rknn_tensor_attr>)`，包含所有输入张量的属性信息。
+    /// 失败时返回 `Err(error_code)`，其中 error_code 是 RKNN 库返回的错误码。
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let ctx = RknnContext::new(&model_data, 0, None)?;
+    /// let input_attrs = ctx.query_input_attrs()?;
+    /// for attr in &input_attrs {
+    ///     println!("输入张量 {}: {:?}", attr.index, attr.dims);
+    /// }
+    /// ```
     pub fn query_input_attrs(&self) -> Result<Vec<raw::rknn_tensor_attr>, i32> {
-        // 1. 先查询输入/输出张量的数量
         let io_num = self.query_io_num()?;
-        let num_inputs = io_num.n_input as usize;
+        self.query_tensor_attrs(
+            io_num.n_input as usize,
+            raw::_rknn_query_cmd_RKNN_QUERY_INPUT_ATTR,
+        )
+    }
 
-        // 2. 创建一个 Vec 用于存放结果，并预分配容量
-        let mut input_attrs = Vec::with_capacity(num_inputs);
+    /// 查询所有输出张量的属性。
+    ///
+    /// # Returns
+    ///
+    /// 成功时返回 `Ok(Vec<rknn_tensor_attr>)`，包含所有输出张量的属性信息。
+    /// 失败时返回 `Err(error_code)`，其中 error_code 是 RKNN 库返回的错误码。
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// let ctx = RknnContext::new(&model_data, 0, None)?;
+    /// let output_attrs = ctx.query_output_attrs()?;
+    /// for attr in &output_attrs {
+    ///     println!("输出张量 {}: {:?}", attr.index, attr.dims);
+    /// }
+    /// ```
+    pub fn query_output_attrs(&self) -> Result<Vec<raw::rknn_tensor_attr>, i32> {
+        let io_num = self.query_io_num()?;
+        self.query_tensor_attrs(
+            io_num.n_output as usize,
+            raw::_rknn_query_cmd_RKNN_QUERY_OUTPUT_ATTR,
+        )
+    }
 
-        // 3. 循环查询每个输入张量的属性
-        for i in 0..num_inputs {
+    /// 通用的张量属性查询方法（私有）。
+    ///
+    /// # Arguments
+    ///
+    /// * `count` - 要查询的张量数量
+    /// * `query_cmd` - RKNN 查询命令（输入或输出）
+    ///
+    /// # Returns
+    ///
+    /// 成功时返回 `Ok(Vec<rknn_tensor_attr>)`，失败时返回 `Err(error_code)`。
+    fn query_tensor_attrs(
+        &self,
+        count: usize,
+        query_cmd: raw::_rknn_query_cmd,
+    ) -> Result<Vec<raw::rknn_tensor_attr>, i32> {
+        // 1. 创建一个 Vec 用于存放结果，并预分配容量
+        let mut attrs = Vec::with_capacity(count);
+
+        // 2. 循环查询每个张量的属性
+        for i in 0..count {
             let mut attr: raw::rknn_tensor_attr = unsafe { std::mem::zeroed() };
             // 关键：设置要查询的张量的索引
             attr.index = i as u32;
@@ -156,7 +210,7 @@ impl RknnContext {
             let ret = unsafe {
                 raw::rknn_query(
                     self.ctx,
-                    raw::_rknn_query_cmd_RKNN_QUERY_INPUT_ATTR,
+                    query_cmd,
                     &mut attr as *mut _ as *mut std::ffi::c_void,
                     std::mem::size_of::<raw::rknn_tensor_attr>() as u32,
                 )
@@ -166,43 +220,10 @@ impl RknnContext {
                 // 如果任何一次查询失败，立即返回错误
                 return Err(ret);
             }
-            input_attrs.push(attr);
+            attrs.push(attr);
         }
 
-        Ok(input_attrs)
-    }
-
-    /// 查询所有输出张量的属性。
-    ///
-    /// # Returns
-    /// 成功时返回 `Ok(Vec<rknn_tensor_attr>)`，失败时返回 `Err(error_code)`。
-    pub fn query_output_attrs(&self) -> Result<Vec<raw::rknn_tensor_attr>, i32> {
-        // 实现逻辑与 query_input_attrs 几乎完全相同，只是查询命令和循环次数不同
-        let io_num = self.query_io_num()?;
-        let num_outputs = io_num.n_output as usize;
-
-        let mut output_attrs = Vec::with_capacity(num_outputs);
-
-        for i in 0..num_outputs {
-            let mut attr: raw::rknn_tensor_attr = unsafe { std::mem::zeroed() };
-            attr.index = i as u32;
-
-            let ret = unsafe {
-                raw::rknn_query(
-                    self.ctx,
-                    raw::_rknn_query_cmd_RKNN_QUERY_OUTPUT_ATTR, // 使用查询输出的命令
-                    &mut attr as *mut _ as *mut std::ffi::c_void,
-                    std::mem::size_of::<raw::rknn_tensor_attr>() as u32,
-                )
-            };
-
-            if ret != raw::RKNN_SUCC as i32 {
-                return Err(ret);
-            }
-            output_attrs.push(attr);
-        }
-
-        Ok(output_attrs)
+        Ok(attrs)
     }
 }
 
