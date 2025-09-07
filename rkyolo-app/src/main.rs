@@ -5,6 +5,8 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
+use walkdir::WalkDir;
 mod drawing;
 mod postprocess;
 
@@ -16,15 +18,15 @@ struct Args {
     #[arg(short, long, default_value = "assets/yolo11.rknn")]
     model: String,
 
-    /// 要进行检测的输入图片路径
+    /// 要进行检测的输入图片路径，也可以是一个包含图片的目录
     #[arg(short, long, default_value = "assets/bus.jpg")]
-    image: String,
+    input: String,
 
     /// 包含类别名称的标签文件路径
     #[arg(short, long, default_value = "assets/coco_labels.txt")]
     labels: String,
 
-    /// 输出结果图片的保存路径
+    /// 输出结果图片的保存路径，如果输入是文件，则为输出文件名；如果输入是目录，则为输出目录
     #[arg(short, long, default_value = "output.jpg")]
     output: String,
 
@@ -101,33 +103,19 @@ fn preprocess_letterbox_quantize(
     Ok((i8_data, info))
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. 解析命令行参数
-    let args = Args::parse();
-    println!("配置参数: {:?}", args);
-    // --- 2. 使用解析出的路径 ---
-    let model_path = Path::new(&args.model);
-    let image_path = Path::new(&args.image);
-    let labels_path = Path::new(&args.labels);
+/// 【新增】处理单张图片的完整流程
+fn process_single_image(
+    ctx: &mut RknnContext,
+    image_path: &Path,
+    labels: &[String],
+    args: &Args,
+) -> Result<(), Box<dyn Error>> {
+    println!("\n--- Processing Image: {:?} ---", image_path);
 
-    // 加载原始图片用于绘图
     let mut original_image = image::open(image_path)?.to_rgb8();
 
-    // --- 2. 加载模型 ---
-    println!("正在加载模型: {:?}", model_path);
-    let model_data = fs::read(model_path)?;
-
-    // --- 3. 初始化 RKNN 上下文 ---
-    println!("正在初始化 RKNN 上下文...");
-    let mut ctx = RknnContext::new(&model_data, 0, None).map_err(RknnError)?;
-    println!("RKNN 上下文初始化成功!");
-
-    // --- 4. 查询模型输入属性 ---
     let input_attrs = ctx.query_input_attrs().map_err(RknnError)?;
     let input_attr = &input_attrs[0];
-    let input_zp = input_attr.zp;
-    let input_scale = input_attr.scale;
-    println!("模型输入量化参数: zp={}, scale={}", input_zp, input_scale);
     let (model_height, model_width, _) =
         if input_attr.fmt == rknn_ffi::raw::_rknn_tensor_format_RKNN_TENSOR_NHWC {
             (input_attr.dims[1], input_attr.dims[2], input_attr.dims[3])
@@ -135,23 +123,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (input_attr.dims[2], input_attr.dims[3], input_attr.dims[1])
         };
 
-    // --- 5. 预处理输入图片并手动量化 ---
-    println!("正在预处理图片并执行手动量化...");
     let (image_data_i8, letterbox_info) = preprocess_letterbox_quantize(
         image_path,
         model_width,
         model_height,
-        input_zp,
-        input_scale,
+        input_attr.zp,
+        input_attr.scale,
     )?;
 
-    // --- 6. 设置输入并执行推理 ---
-    println!("正在设置INT8输入数据并执行推理...");
-    // 将 Vec<i8> 的数据安全地转换为 &[u8] 以传递给 FFI
     let image_data_u8: &[u8] = unsafe {
         std::slice::from_raw_parts(image_data_i8.as_ptr() as *const u8, image_data_i8.len())
     };
-    // 将输入类型明确设置为 INT8
     ctx.set_input(
         0,
         rknn_ffi::raw::_rknn_tensor_type_RKNN_TENSOR_INT8,
@@ -160,73 +142,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(RknnError)?;
     ctx.run().map_err(RknnError)?;
-    println!("推理完成!");
 
-    // --- 7. 获取输出 ---
-    println!("正在获取输出...");
-    let outputs_obj = ctx.get_outputs().map_err(RknnError)?; // 重命名以示区分
+    let outputs_obj = ctx.get_outputs().map_err(RknnError)?;
     let output_attrs = ctx.query_output_attrs().map_err(RknnError)?;
-    println!("成功获取 {} 个输出张量。", outputs_obj.all().len());
-
-    // // --- 诊断信息：打印输出张量的维度 ---
-    // println!("--- 输出张量属性诊断 ---");
-    // for (i, attr) in output_attrs.iter().enumerate() {
-    //     println!(
-    //         "  - Attr {}: name={}, fmt={:?}, dims=[{}, {}, {}, {}]",
-    //         i,
-    //         std::str::from_utf8(&attr.name).unwrap_or(""), // C字符串转Rust字符串
-    //         attr.fmt,
-    //         attr.dims[0],
-    //         attr.dims[1],
-    //         attr.dims[2],
-    //         attr.dims[3]
-    //     );
-    // }
-    // println!("--------------------------");
-
-    // --- 8. 准备后处理函数的输入 ---
-    // 从 RknnOutputs 对象中提取出原始的字节切片
     let outputs_data: Vec<&[u8]> = outputs_obj
         .all()
         .iter()
         .map(|o| unsafe { std::slice::from_raw_parts(o.buf as *const u8, o.size as usize) })
         .collect();
 
-    // --- 9. 执行后处理 ---
     let detections = postprocess::post_process_i8(
         &outputs_data,
         &output_attrs,
         args.conf_thresh,
         args.iou_thresh,
-        letterbox_info, // <-- 新增参数
+        letterbox_info,
     );
 
-    // --- 10. 打印结果 ---
-    println!("--- 检测结果 ({} 个) ---", detections.len());
-    // 提前加载标签用于打印
-    let labels_for_print = drawing::load_labels(labels_path)?;
-    for det in &detections {
-        let label = labels_for_print
-            .get(det.class_id as usize)
-            .map_or("unknown", |s| s.as_str());
-        println!(
-            "类别: {} ({}), 置信度: {:.4}, 框: {:?}", // 打印类别名和更精确的置信度
-            det.class_id, label, det.confidence, det.bbox
-        );
-    }
-    println!("--------------------------");
+    drawing::draw_results(&mut original_image, &detections, labels);
 
-    // --- 11. 加载标签并绘制结果 ---
-    println!("正在加载标签文件: {:?}", labels_path);
+    // 决定输出路径
+    let output_path = if Path::new(&args.output).is_dir() {
+        let file_name = image_path.file_name().ok_or("Invalid image path")?;
+        PathBuf::from(&args.output).join(file_name)
+    } else {
+        PathBuf::from(&args.output)
+    };
+
+    println!("Saving result to: {:?}", output_path);
+    original_image.save(&output_path)?;
+
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 解析命令行参数
+    let args = Args::parse();
+    println!("配置参数: {:?}", args);
+    // --- 2. 使用解析出的路径 ---
+    let model_path = Path::new(&args.model);
+    let input_path = Path::new(&args.input);
+    let labels_path = Path::new(&args.labels);
+    let output_path = Path::new(&args.output);
+
+    // --- 1. 初始化模型和标签 ---
+    let model_data = fs::read(model_path)?;
+    let mut ctx = RknnContext::new(&model_data, 0, None).map_err(RknnError)?;
     let labels = drawing::load_labels(labels_path)?;
 
-    println!("正在将检测结果绘制到图片上...");
-    drawing::draw_results(&mut original_image, &detections, &labels);
+    // --- 2. 判断输入是文件还是目录 ---
+    if input_path.is_file() {
+        if output_path.is_dir() {
+            // 如果输出是目录，确保它存在
+            fs::create_dir_all(output_path)?;
+        }
+        process_single_image(&mut ctx, input_path, &labels, &args)?;
+    } else if input_path.is_dir() {
+        // 确保输出目录存在
+        fs::create_dir_all(output_path)?;
 
-    // --- 12. 保存结果图片到指定的输出路径 ---
-    let output_path = Path::new(&args.output);
-    println!("正在保存结果图片到: {:?}", output_path);
-    original_image.save(output_path)?;
-    println!("结果已保存！");
+        for entry in WalkDir::new(input_path).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                match ext.to_lowercase().as_str() {
+                    "jpg" | "jpeg" | "png" | "bmp" => {
+                        if let Err(e) = process_single_image(&mut ctx, path, &labels, &args) {
+                            eprintln!("Error processing file {:?}: {}", path, e);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        return Err(format!(
+            "Input path not found or is not a file/directory: {}",
+            args.input
+        )
+        .into());
+    }
+
+    println!("\nAll tasks completed.");
     Ok(())
 }
