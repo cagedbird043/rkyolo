@@ -1,5 +1,6 @@
 //! YOLO 模型后处理模块 (INT8 版本)
 
+use crate::LetterboxInfo;
 use rknn_ffi::raw::rknn_tensor_attr;
 use std::collections::HashMap;
 
@@ -63,56 +64,63 @@ fn decode_branch(
     let mut detections = Vec::new();
     let grid_h = box_attr.dims[2] as usize;
     let grid_w = box_attr.dims[3] as usize;
-
     let grid_len = grid_h * grid_w;
 
-    // 遍历每一个网格单元
+    // 【终极修正】: 类别数直接由score张量的通道数决定！
+    let class_num = score_attr.dims[1] as usize;
+
+    let dfl_len = box_attr.dims[1] as usize / 4;
+
     for y in 0..grid_h {
         for x in 0..grid_w {
-            let offset = y * grid_w + x;
+            let grid_cell_offset = y * grid_w + x;
 
-            // 找到分数最高的类别
-            let mut max_score = 0.0;
-            let mut max_class_id = -1;
-
-            for c in 0..OBJ_CLASS_NUM {
-                let score_q = score_data[c * grid_len + offset];
+            // 这个循环现在可以正确地遍历所有80个类别了
+            for c in 0..class_num {
+                let score_offset = c * grid_len + grid_cell_offset;
+                let score_q = score_data[score_offset];
                 let score = dequantize(score_q, score_attr.zp, score_attr.scale);
-                if score > max_score {
-                    max_score = score;
-                    max_class_id = c as i32;
+
+                if score > conf_threshold {
+                    let mut box_dist = [0.0f32; 4];
+                    for i in 0..4 {
+                        let mut acc_sum = 0.0;
+                        let mut exp_sum = 0.0;
+                        let mut exp_values = [0.0f32; 16];
+
+                        for j in 0..dfl_len {
+                            let offset = (i * dfl_len + j) * grid_len + grid_cell_offset;
+                            let box_q = box_data[offset];
+                            let box_f = dequantize(box_q, box_attr.zp, box_attr.scale);
+                            exp_values[j] = box_f.exp();
+                            exp_sum += exp_values[j];
+                        }
+
+                        for j in 0..dfl_len {
+                            acc_sum += exp_values[j] / exp_sum * (j as f32);
+                        }
+                        box_dist[i] = acc_sum;
+                    }
+
+                    let x_center_grid = x as f32 + 0.5;
+                    let y_center_grid = y as f32 + 0.5;
+
+                    let left = x_center_grid - box_dist[0];
+                    let top = y_center_grid - box_dist[1];
+                    let right = x_center_grid + box_dist[2];
+                    let bottom = y_center_grid + box_dist[3];
+
+                    let x1 = left * stride as f32;
+                    let y1 = top * stride as f32;
+                    let x2 = right * stride as f32;
+                    let y2 = bottom * stride as f32;
+
+                    detections.push(Detection {
+                        bbox: BoundingBox { x1, y1, x2, y2 },
+                        confidence: score,
+                        class_id: c as i32,
+                    });
                 }
-            }
-
-            // 如果最高分大于阈值，则解码边界框
-            if max_score > conf_threshold {
-                let box_offset = (y * grid_w + x) * 4;
-                let x1_q = box_data[box_offset + 0];
-                let y1_q = box_data[box_offset + 1];
-                let x2_q = box_data[box_offset + 2];
-                let y2_q = box_data[box_offset + 3];
-
-                let x1_f = dequantize(x1_q, box_attr.zp, box_attr.scale);
-                let y1_f = dequantize(y1_q, box_attr.zp, box_attr.scale);
-                let x2_f = dequantize(x2_q, box_attr.zp, box_attr.scale);
-                let y2_f = dequantize(y2_q, box_attr.zp, box_attr.scale);
-
-                // (cx, cy, w, h) -> (x1, y1, x2, y2)
-                let center_x = (x as f32 - x1_f + 0.5) * stride as f32;
-                let center_y = (y as f32 - y1_f + 0.5) * stride as f32;
-                let width = (x as f32 + x2_f + 0.5) * stride as f32;
-                let height = (y as f32 + y2_f + 0.5) * stride as f32;
-
-                detections.push(Detection {
-                    bbox: BoundingBox {
-                        x1: center_x,
-                        y1: center_y,
-                        x2: width,
-                        y2: height,
-                    },
-                    confidence: max_score,
-                    class_id: max_class_id,
-                });
             }
         }
     }
@@ -125,6 +133,7 @@ pub fn post_process_i8(
     output_attrs: &[rknn_tensor_attr],
     conf_threshold: f32,
     nms_threshold: f32,
+    letterbox: LetterboxInfo,
 ) -> Vec<Detection> {
     let model_in_h = 640;
     let output_per_branch = output_attrs.len() / 3;
@@ -187,9 +196,31 @@ pub fn post_process_i8(
         final_detections.extend(nms_detections);
     }
 
+    // --- 【关键修正】对最终结果进行坐标变换 ---
+    let mut corrected_detections = Vec::with_capacity(final_detections.len());
+    for det in final_detections {
+        let bbox = det.bbox;
+
+        // 应用Letterbox的逆运算
+        let corrected_x1 = (bbox.x1 - letterbox.pad_x as f32) / letterbox.scale;
+        let corrected_y1 = (bbox.y1 - letterbox.pad_y as f32) / letterbox.scale;
+        let corrected_x2 = (bbox.x2 - letterbox.pad_x as f32) / letterbox.scale;
+        let corrected_y2 = (bbox.y2 - letterbox.pad_y as f32) / letterbox.scale;
+
+        corrected_detections.push(Detection {
+            bbox: BoundingBox {
+                x1: corrected_x1,
+                y1: corrected_y1,
+                x2: corrected_x2,
+                y2: corrected_y2,
+            },
+            ..det // Rust 的 struct update 语法，复用其他字段
+        });
+    }
+
     println!(
         "后处理完成，共找到 {} 个最终目标（NMS后）",
-        final_detections.len()
+        corrected_detections.len()
     );
-    final_detections
+    corrected_detections
 }

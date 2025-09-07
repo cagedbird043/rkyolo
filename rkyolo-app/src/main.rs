@@ -1,10 +1,19 @@
+use image::{Rgb, RgbImage, imageops};
 use rknn_ffi::RknnContext;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::Path; // 确保 RgbImage 和 Rgb 被导入
+mod drawing;
 mod postprocess;
 
+/// 存储 Letterbox 预处理的相关信息
+#[derive(Debug, Clone, Copy)]
+struct LetterboxInfo {
+    scale: f32,
+    pad_x: u32,
+    pad_y: u32,
+}
 /// 自定义错误类型，用于封装来自 RKNN FFI 调用的 i32 错误码。
 #[derive(Debug)]
 struct RknnError(i32);
@@ -20,35 +29,56 @@ impl fmt::Display for RknnError {
 // 并且可以被放入 Box<dyn Error> 中。
 impl Error for RknnError {}
 
-// --- 您的 preprocess_image 函数 ---
-/// 使用 `image` crate 预处理图像。
-///
-/// 1. 从路径加载图片。
-/// 2. 转换为 RGB8 格式。
-/// 3. 暴力缩放到目标尺寸。
-/// 4. 将像素数据提取为扁平化的 Vec<u8>。
-fn preprocess_image(
+/// 使用 `image` crate 和 Letterboxing 技术预处理图像。
+fn preprocess_letterbox(
     image_path: &Path,
     target_width: u32,
     target_height: u32,
-) -> Result<Vec<u8>, image::ImageError> {
-    let img = image::open(image_path)?;
-    let rgb_img = img.to_rgb8();
-    let resized = image::imageops::resize(
-        &rgb_img,
-        target_width,
-        target_height,
-        image::imageops::FilterType::Lanczos3,
-    );
-    Ok(resized.into_raw())
+) -> Result<(Vec<u8>, LetterboxInfo), image::ImageError> {
+    let img = image::open(image_path)?.to_rgb8();
+    let (original_w, original_h) = img.dimensions();
+
+    // 1. 计算缩放比例
+    let scale_w = target_width as f32 / original_w as f32;
+    let scale_h = target_height as f32 / original_h as f32;
+    let scale = scale_w.min(scale_h);
+
+    // 2. 计算缩放后尺寸
+    let new_w = (original_w as f32 * scale) as u32;
+    let new_h = (original_h as f32 * scale) as u32;
+
+    // 缩放图像
+    let resized_img = imageops::resize(&img, new_w, new_h, imageops::FilterType::Lanczos3);
+
+    // 3. 创建灰色画布
+    let mut canvas = RgbImage::from_pixel(target_width, target_height, Rgb([114, 114, 114]));
+
+    // 4. 计算填充
+    let pad_x = (target_width - new_w) / 2;
+    let pad_y = (target_height - new_h) / 2;
+
+    // 5. 粘贴图像
+    imageops::overlay(&mut canvas, &resized_img, pad_x.into(), pad_y.into());
+
+    // 6. 返回数据和信息
+    let info = LetterboxInfo {
+        scale,
+        pad_x,
+        pad_y,
+    };
+    Ok((canvas.into_raw(), info))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("RKNN YOLO Rust Demo - 启动");
 
     // --- 1. 定义路径 ---
-    let model_path = Path::new("./yolo11.rknn"); // 假设模型在当前目录
-    let image_path = Path::new("bus.jpg"); // TODO: 准备一张名为 bus.jpg 的图片
+    let model_path = Path::new("./yolo11.rknn");
+    let image_path = Path::new("bus.jpg");
+    let labels_path = Path::new("coco_labels.txt");
+
+    // 加载原始图片用于绘图
+    let mut original_image = image::open(image_path)?.to_rgb8();
 
     // --- 2. 加载模型 ---
     println!("正在加载模型: {:?}", model_path);
@@ -80,7 +110,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- 5. 预处理输入图片 ---
     println!("正在预处理图片: {:?}", image_path);
-    let image_data = preprocess_image(image_path, model_width, model_height)?;
+    // 调用新的 letterbox 函数
+    let (image_data, letterbox_info) = preprocess_letterbox(image_path, model_width, model_height)?;
 
     // --- 6. 设置输入并执行推理 ---
     println!("正在设置输入数据并执行推理...");
@@ -95,6 +126,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output_attrs = ctx.query_output_attrs().map_err(RknnError)?;
     println!("成功获取 {} 个输出张量。", outputs_obj.all().len());
 
+    // --- 诊断信息：打印输出张量的维度 ---
+    println!("--- 输出张量属性诊断 ---");
+    for (i, attr) in output_attrs.iter().enumerate() {
+        println!(
+            "  - Attr {}: name={}, fmt={:?}, dims=[{}, {}, {}, {}]",
+            i,
+            std::str::from_utf8(&attr.name).unwrap_or(""), // C字符串转Rust字符串
+            attr.fmt,
+            attr.dims[0],
+            attr.dims[1],
+            attr.dims[2],
+            attr.dims[3]
+        );
+    }
+    println!("--------------------------");
+
     // --- 8. 准备后处理函数的输入 ---
     // 从 RknnOutputs 对象中提取出原始的字节切片
     let outputs_data: Vec<&[u8]> = outputs_obj
@@ -105,10 +152,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- 9. 执行后处理 ---
     let detections = postprocess::post_process_i8(
-        &outputs_data, // 传递切片引用
+        &outputs_data,
         &output_attrs,
-        0.25, // conf_threshold
-        0.45, // nms_threshold
+        0.25,
+        0.45,
+        letterbox_info, // <-- 新增参数
     );
 
     // --- 10. 打印结果 ---
@@ -118,6 +166,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             det.class_id, det.confidence, det.bbox
         );
     }
+
+    // --- 11. 加载标签并绘制结果 ---
+    println!("正在加载标签文件: {:?}", labels_path);
+    let labels = drawing::load_labels(labels_path)?;
+
+    println!("正在将检测结果绘制到图片上...");
+    drawing::draw_results(&mut original_image, &detections, &labels);
+
+    // --- 12. 保存结果图片 ---
+    let output_path = Path::new("output.jpg");
+    println!("正在保存结果图片到: {:?}", output_path);
+    original_image.save(output_path)?;
+    println!("结果已保存！");
 
     println!("Demo 运行结束。");
     Ok(())
