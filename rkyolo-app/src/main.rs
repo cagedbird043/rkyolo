@@ -1,9 +1,11 @@
 use clap::Parser;
 use log::{debug, error, info};
+use rkyolo_core::rknn_ffi::raw::rknn_tensor_attr;
 use rkyolo_core::{
-    Lang, RknnContext, RknnError, draw_results, image, load_labels, post_process_i8,
-    preprocess_letterbox_quantize, rknn_ffi,
+    Detection, Lang, RknnContext, RknnError, draw_results, get_type_string, image, load_labels,
+    post_process_i8, preprocess_letterbox_quantize, rknn_ffi,
 };
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,14 +39,87 @@ struct Args {
     #[arg(long, default_value_t = 0.45)]
     iou_thresh: f32,
 
-    /// 增加日志详细程度 (-v -> info, -vv -> debug, -vvv -> trace)
+    /// 增加日志详细程度 (-v -> debug, -vv -> trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
     /// 设置日志和输出信息的语言
     #[arg(long, value_enum, default_value_t = rkyolo_core::Lang::En)]
-    // <--- 显式使用 rkyolo_core::Lang
     lang: Lang,
+}
+
+/// 【新增】辅助函数：记录检测结果摘要
+fn log_detection_summary(detections: &[Detection], labels: &[String], lang: &Lang) {
+    let mut counts: HashMap<i32, usize> = HashMap::new();
+    for det in detections {
+        *counts.entry(det.class_id).or_insert(0) += 1;
+    }
+
+    match lang {
+        Lang::En => {
+            info!(
+                "Post-processing complete. Found {} final objects (after NMS).",
+                detections.len()
+            );
+            if !detections.is_empty() {
+                info!("Detection summary:");
+                for (class_id, count) in &counts {
+                    let label = labels
+                        .get(*class_id as usize)
+                        .map_or("unknown", |s| s.as_str());
+                    info!("  - Class '{}': {} objects", label, count);
+                }
+            }
+        }
+        Lang::Zh => {
+            info!(
+                "后处理完成，共找到 {} 个最终目标（NMS后）。",
+                detections.len()
+            );
+            if !detections.is_empty() {
+                info!("检测结果摘要:");
+                for (class_id, count) in &counts {
+                    let label = labels
+                        .get(*class_id as usize)
+                        .map_or("未知类别", |s| s.as_str());
+                    info!("  - 类别 '{}': {} 个目标", label, count);
+                }
+            }
+        }
+    }
+}
+
+/// 【新增】辅助函数：记录张量属性
+fn log_tensor_attrs(attrs: &[rknn_tensor_attr], name_en: &str, name_zh: &str, lang: &Lang) {
+    let (name, _dims_str, format_str, type_str, qnt_str) = match lang {
+        Lang::En => (name_en, "Dims", "Format", "Type", "Quantization"),
+        Lang::Zh => (name_zh, "维度", "格式", "类型", "量化"),
+    };
+    info!("- {}: {}", name, attrs.len());
+    for (i, attr) in attrs.iter().enumerate() {
+        let dims: Vec<String> = attr.dims[..attr.n_dims as usize]
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        let type_name = get_type_string(attr.type_);
+        info!(
+            "  - [{}]: {} [{}], {}: {}, {}: {}, {}: ZP={}, Scale={:.4}",
+            i,
+            attr.name.iter().map(|&c| c as char).collect::<String>(),
+            dims.join("x"),
+            format_str,
+            if attr.fmt == rknn_ffi::raw::_rknn_tensor_format_RKNN_TENSOR_NHWC {
+                "NHWC"
+            } else {
+                "NCHW"
+            },
+            type_str,
+            type_name,
+            qnt_str,
+            attr.zp,
+            attr.scale
+        );
+    }
 }
 
 /// 处理单张图片的完整流程
@@ -54,7 +129,6 @@ fn process_single_image(
     labels: &[String],
     args: &Args,
 ) -> Result<(), Box<dyn Error>> {
-    // 日志信息已移至 main 函数的循环中
     let mut original_image = image::open(image_path)?.to_rgb8();
 
     let input_attrs = ctx.query_input_attrs().map_err(RknnError::from)?;
@@ -100,12 +174,13 @@ fn process_single_image(
         args.conf_thresh,
         args.iou_thresh,
         letterbox_info,
-        args.lang.clone(), // <--- 传递 lang 参数
     );
+
+    // 【新增】调用辅助函数打印检测摘要
+    log_detection_summary(&detections, labels, &args.lang);
 
     draw_results(&mut original_image, &detections, labels);
 
-    // 决定输出路径
     let output_path = if Path::new(&args.output).is_dir() {
         let file_name = image_path.file_name().ok_or("Invalid image path")?;
         PathBuf::from(&args.output).join(file_name)
@@ -123,46 +198,55 @@ fn process_single_image(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. 解析命令行参数
     let args = Args::parse();
 
-    // 2.【新增】根据命令行参数初始化日志系统
+    // 【修改】默认级别为 Info
     let log_level = match args.verbose {
-        0 => log::LevelFilter::Warn,
-        1 => log::LevelFilter::Info,
-        2 => log::LevelFilter::Debug,
+        0 => log::LevelFilter::Info,
+        1 => log::LevelFilter::Debug,
         _ => log::LevelFilter::Trace,
     };
     env_logger::Builder::new().filter_level(log_level).init();
 
     debug!("Parsed command line arguments: {:?}", args);
 
-    // --- 使用解析出的路径 ---
     let model_path = Path::new(&args.model);
     let input_path = Path::new(&args.input);
     let labels_path = Path::new(&args.labels);
     let output_path = Path::new(&args.output);
 
-    // --- 初始化模型和标签 ---
     let model_data = fs::read(model_path)?;
     let mut ctx = RknnContext::new(&model_data, 0, None).map_err(RknnError)?;
     let labels = load_labels(labels_path)?;
 
-    // --- 判断输入是文件还是目录 ---
+    // 【新增】打印模型信息摘要
+    info!(
+        "{}",
+        match args.lang {
+            Lang::En => "--- Model Initialized ---",
+            Lang::Zh => "--- 模型初始化完成 ---",
+        }
+    );
+    let input_attrs = ctx.query_input_attrs().map_err(RknnError::from)?;
+    let output_attrs = ctx.query_output_attrs().map_err(RknnError::from)?;
+    log_tensor_attrs(&input_attrs, "Input Tensors", "输入张量", &args.lang);
+    log_tensor_attrs(&output_attrs, "Output Tensors", "输出张量", &args.lang);
+    info!("-------------------------");
+
     if input_path.is_file() {
         if output_path.is_dir() {
             fs::create_dir_all(output_path)?;
         }
         match args.lang {
-            Lang::En => info!("Processing single image: {:?}", input_path),
-            Lang::Zh => info!("处理单张图片: {:?}", input_path),
+            Lang::En => info!("\nProcessing single image: {:?}", input_path),
+            Lang::Zh => info!("\n处理单张图片: {:?}", input_path),
         }
         process_single_image(&mut ctx, input_path, &labels, &args)?;
     } else if input_path.is_dir() {
         fs::create_dir_all(output_path)?;
         match args.lang {
-            Lang::En => info!("Processing all images in directory: {:?}", input_path),
-            Lang::Zh => info!("处理目录中的所有图片: {:?}", input_path),
+            Lang::En => info!("\nProcessing all images in directory: {:?}", input_path),
+            Lang::Zh => info!("\n处理目录中的所有图片: {:?}", input_path),
         }
 
         for entry in WalkDir::new(input_path).into_iter().filter_map(|e| e.ok()) {
@@ -190,7 +274,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Input path not found or is not a file/directory: {}",
             args.input
         );
-        // 使用 error! 宏记录错误，然后返回它
         error!("{}", &err_msg);
         return Err(err_msg.into());
     }

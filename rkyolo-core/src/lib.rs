@@ -4,10 +4,10 @@ mod postprocess;
 pub use drawing::{draw_results, load_labels};
 pub use image;
 pub use image::{Rgb, RgbImage, imageops, open};
-pub use log::{debug, trace}; // <--- 新增
+pub use log::{debug, trace};
 pub use postprocess::{BoundingBox, Detection, post_process_i8};
 pub use rknn_ffi;
-pub use rknn_ffi::RknnContext;
+pub use rknn_ffi::{RknnContext, get_type_string};
 
 use std::error::Error;
 use std::fmt;

@@ -18,6 +18,8 @@ fn main() {
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         // `__u128` 在某些目标上可能与 C 不兼容，通常建议禁用它
         .blocklist_item("__u128")
+        // 生成 inline 函数的绑定
+        .generate_inline_functions(true)
         // 完成配置并生成绑定
         .generate()
         // 如果生成失败，则 panic

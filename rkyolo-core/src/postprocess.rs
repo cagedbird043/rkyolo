@@ -1,7 +1,7 @@
 //! YOLO 模型后处理模块 (INT8 版本)
 
-use crate::{Lang, LetterboxInfo}; // <--- 引入 Lang
-use log::{debug, info}; // <--- 引入 log 宏
+use crate::LetterboxInfo;
+use log::{debug, trace};
 use rknn_ffi::raw::rknn_tensor_attr;
 
 // --- 数据结构 ---
@@ -104,6 +104,12 @@ fn decode_branch(
                         box_dist[i] = acc_sum;
                     }
 
+                    // 【新增】TRACE 日志，用于深度调试
+                    trace!(
+                        "  [TRACE] Candidate found at grid(y={}, x={}), class={}, score={:.4}, box_dist=[{:.2}, {:.2}, {:.2}, {:.2}]",
+                        y, x, c, score, box_dist[0], box_dist[1], box_dist[2], box_dist[3]
+                    );
+
                     let x_center_grid = x as f32 + 0.5;
                     let y_center_grid = y as f32 + 0.5;
 
@@ -136,7 +142,6 @@ pub fn post_process_i8(
     conf_threshold: f32,
     nms_threshold: f32,
     letterbox: LetterboxInfo,
-    lang: Lang, // <--- 新增 lang 参数
 ) -> Vec<Detection> {
     let model_in_h = 640;
     debug!(
@@ -241,6 +246,8 @@ pub fn post_process_i8(
         });
     }
 
+    debug!("{} detections remaining after NMS.", nms_detections.len());
+
     let mut corrected_detections = Vec::with_capacity(nms_detections.len());
     for det in nms_detections {
         let bbox = det.bbox;
@@ -259,16 +266,6 @@ pub fn post_process_i8(
         });
     }
 
-    match lang {
-        Lang::En => info!(
-            "Post-processing complete. Found {} final objects (after NMS).",
-            corrected_detections.len()
-        ),
-        Lang::Zh => info!(
-            "后处理完成，共找到 {} 个最终目标（NMS后）。",
-            corrected_detections.len()
-        ),
-    }
-
+    // INFO 级别的摘要日志已移至 app 层
     corrected_detections
 }
