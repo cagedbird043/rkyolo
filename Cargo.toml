@@ -1,4 +1,4 @@
-workspace = { members = ["rknn-ffi"] }
+workspace = { members = ["rknn-ffi", "rkyolo-app"] }
 [package]
 name = "rkyolo"
 version = "0.1.0"
