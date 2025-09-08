@@ -10,3 +10,5 @@ MTDC-UAV*
 .VSCodeCounter
 *.mp4
 *log.txt
+predictions.json
+*test*

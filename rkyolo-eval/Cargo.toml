@@ -1,0 +1,11 @@
+[package]
+name = "rkyolo-eval"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"                                  # 我们会用 JSON 来保存预测结果
+anyhow = "1.0"                                      # 用于简洁的错误处理
