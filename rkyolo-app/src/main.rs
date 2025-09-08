@@ -7,7 +7,7 @@ use crate::processors::{process_directory, process_single_image, process_video_s
 use crate::utils::{ExecutionMode, log_tensor_attrs, try_setup_zero_copy};
 use clap::Parser;
 use log::{debug, error, info};
-use rkyolo_core::{RknnContext, RknnError, load_labels};
+use rkyolo_core::{RknnContext, RknnError};
 use std::error::Error;
 use std::fs;
 
@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 3. 初始化模型和标签
     let model_data = fs::read(&config.model_path)?;
     let mut ctx = RknnContext::new(&model_data, 0, None).map_err(RknnError)?;
-    let labels = load_labels(&config.labels_path)?;
+    let labels = &config.labels; // <-- 直接引用 config 中的 labels
 
     // 4. 初始化执行模式 (Zero-Copy 或 Standard)
     let mut execution_mode = if config.disable_zero_copy {

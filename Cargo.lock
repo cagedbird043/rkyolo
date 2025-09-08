@@ -1334,6 +1334,7 @@ dependencies = [
  "rkyolo-core",
  "serde",
  "serde_json",
+ "serde_yaml",
  "walkdir",
 ]
 
