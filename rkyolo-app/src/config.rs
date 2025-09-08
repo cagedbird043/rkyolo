@@ -124,7 +124,6 @@ pub struct Args {
     output_video: Option<String>,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     headless: bool,
-    /// 【新增】将检测结果以 JSON 格式保存到文件，用于后续评估
     #[arg(long)]
     save_preds: Option<PathBuf>,
 }
@@ -244,9 +243,6 @@ pub fn validate_and_build_config(args: Args) -> Result<AppConfig> {
             if args.output_video.is_some() {
                 anyhow::bail!("--output-video cannot be used with a single image input.");
             }
-            if args.save_preds.is_some() {
-                anyhow::bail!("--save-preds is only for directory input for evaluation.");
-            }
             // --output 必须是文件
             let mode = match args.output {
                 Some(p) => {
@@ -260,31 +256,30 @@ pub fn validate_and_build_config(args: Args) -> Result<AppConfig> {
                 }
                 None => OutputMode::None, // 默认不保存
             };
-            (mode, None, None)
+            (mode, None, args.save_preds)
         }
         InputSource::ImageDirectory(_) => {
             // --output-video 对目录非法
             if args.output_video.is_some() {
                 anyhow::bail!("--output-video cannot be used with a directory input.");
             }
-            // --output 必须是目录
+            // --output (如果提供) 必须是一个目录
             let mode = match args.output {
                 Some(p) => {
                     let path = PathBuf::from(p);
                     // 检查路径是否存在且是否是一个文件
                     if path.is_file() {
                         anyhow::bail!(
-                            "Output path {:?} exists but is a file, not a directory.",
+                            "For directory input, --output path {:?} exists but is a file, not a directory.",
                             path
                         );
                     }
                     // 如果路径不存在，则尝试创建它
                     if !path.exists() {
                         info!("Output directory {:?} does not exist. Creating it...", path);
-                        // `create_dir_all` 等同于 `mkdir -p`
-                        // `?` 操作符会自动处理并传播任何IO错误 (如权限不足)
                         fs::create_dir_all(&path)?;
                     }
+                    // 【关键修正】返回正确的 OutputMode 类型
                     OutputMode::Directory(path)
                 }
                 None => OutputMode::None,

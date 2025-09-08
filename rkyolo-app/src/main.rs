@@ -2,12 +2,14 @@ mod config;
 mod processors;
 mod utils;
 
-use crate::config::{Args, InputSource, validate_and_build_config};
+use crate::config::{Args, Bbox, InputSource, Prediction, validate_and_build_config};
 use crate::processors::{process_directory, process_single_image, process_video_source};
 use crate::utils::{ExecutionMode, log_tensor_attrs, try_setup_zero_copy};
+use anyhow::Context;
 use clap::Parser;
 use log::{debug, error, info};
 use rkyolo_core::{RknnContext, RknnError};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 
@@ -60,16 +62,49 @@ fn main() -> Result<(), Box<dyn Error>> {
     match &config.input_source {
         InputSource::SingleImage(path) => {
             info!("\nProcessing single image: {:?}", path);
-            process_single_image(
+            // 【修正1】捕获函数的返回值
+            let detections = process_single_image(
                 &mut ctx,
                 &mut execution_mode,
                 path,
-                &labels,
+                labels, // 注意这里我们使用了 main 函数作用域内的 labels 变量
                 config.conf_thresh,
                 config.iou_thresh,
                 &config.output_mode,
                 &config.lang,
             )?;
+
+            // 【修正2】添加 JSON 保存逻辑
+            if let Some(save_path) = &config.save_preds_path {
+                info!("Saving prediction to JSON file: {:?}", save_path);
+                let mut all_predictions: HashMap<String, Vec<Prediction>> = HashMap::new();
+
+                let image_filename = path
+                    .file_name()
+                    .context("Failed to get filename from path")?
+                    .to_str()
+                    .context("Filename is not valid UTF-8")?
+                    .to_string();
+
+                let preds: Vec<Prediction> = detections
+                    .into_iter()
+                    .map(|d| Prediction {
+                        class_id: d.class_id,
+                        confidence: d.confidence,
+                        bbox: Bbox {
+                            x1: d.bbox.x1,
+                            y1: d.bbox.y1,
+                            x2: d.bbox.x2,
+                            y2: d.bbox.y2,
+                        },
+                    })
+                    .collect();
+
+                all_predictions.insert(image_filename, preds);
+
+                let json_string = serde_json::to_string_pretty(&all_predictions)?;
+                fs::write(save_path, json_string)?;
+            }
         }
         InputSource::ImageDirectory(path) => {
             info!("\nProcessing all images in directory: {:?}", path);

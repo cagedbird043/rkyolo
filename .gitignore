@@ -12,3 +12,5 @@ MTDC-UAV*
 *log.txt
 predictions.json
 *test*
+*results*
+predictions*.json
